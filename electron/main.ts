@@ -119,12 +119,22 @@ function backupsDir(): string {
   return path.join(app.getPath('userData'), 'backups')
 }
 
+/** The window, unless it has been closed: on macOS the app and its workers outlive it. */
+function liveWindow(): BrowserWindow | null {
+  return mainWindow && !mainWindow.isDestroyed() ? mainWindow : null
+}
+
+function sendToRenderer(channel: string, ...args: unknown[]) {
+  const win = liveWindow()
+  if (win && !win.webContents.isDestroyed()) win.webContents.send(channel, ...args)
+}
+
 function broadcastIndexUpdated() {
-  mainWindow?.webContents.send(IPC.onIndexUpdated)
+  sendToRenderer(IPC.onIndexUpdated)
 }
 
 function broadcastIndexProgress(p: IndexProgress) {
-  mainWindow?.webContents.send(IPC.onIndexProgress, p)
+  sendToRenderer(IPC.onIndexProgress, p)
 }
 
 /**
@@ -180,6 +190,9 @@ function createWindow() {
   })
 
   mainWindow.once('ready-to-show', () => mainWindow?.show())
+  mainWindow.on('closed', () => {
+    mainWindow = null
+  })
   applyNavigationPolicy(mainWindow)
 
   if (process.env.VITE_DEV_SERVER_URL) {
@@ -581,7 +594,8 @@ function registerIpc() {
       defaultPath: path.join(app.getPath('documents'), `claude-vault-export-${stamp}.${ext}`),
       filters: [ext === 'csv' ? { name: 'CSV', extensions: ['csv'] } : { name: 'Markdown', extensions: ['md'] }],
     }
-    const res = mainWindow ? await dialog.showSaveDialog(mainWindow, opts) : await dialog.showSaveDialog(opts)
+    const win = liveWindow()
+    const res = win ? await dialog.showSaveDialog(win, opts) : await dialog.showSaveDialog(opts)
     if (res.canceled || !res.filePath) return { saved: false }
     if (isInsideClaudeHome(res.filePath)) {
       return { saved: false, error: 'claude-home' }
@@ -730,31 +744,38 @@ function reportOpenOutcome(outcome: OpenOutcome) {
   })
 }
 
-function reportFatal(scope: string, err: unknown) {
+/** Dialogs already raised, so a failure that repeats (on every index update, say) raises one. */
+const fatalShown = new Set<string>()
+
+function reportFatal(scope: string, err: unknown): Promise<unknown> | undefined {
   const message = err instanceof Error ? (err.stack ?? err.message) : String(err)
   console.error(`[vault] ${scope}:`, message)
-  if (app.isReady()) {
-    const s = MAIN_STRINGS[mainLocale()]
-    dialog.showMessageBox({
-      type: 'error',
-      title: APP_NAME,
-      message: s.fatal,
-      detail: `${scope}\n\n${message.slice(0, 1500)}`,
-      buttons: [s.continue],
-    })
-  }
+  const key = `${scope}\n${message}`
+  if (!app.isReady() || fatalShown.has(key)) return undefined
+  fatalShown.add(key)
+  const s = MAIN_STRINGS[mainLocale()]
+  return dialog.showMessageBox({
+    type: 'error',
+    title: APP_NAME,
+    message: s.fatal,
+    detail: `${scope}\n\n${message.slice(0, 1500)}`,
+    buttons: [s.continue],
+  })
 }
 
 // A background indexing failure must not take the whole app down.
-process.on('uncaughtException', (err) => reportFatal('uncaughtException', err))
-process.on('unhandledRejection', (err) => reportFatal('unhandledRejection', err))
+process.on('uncaughtException', (err) => void reportFatal('uncaughtException', err))
+process.on('unhandledRejection', (err) => void reportFatal('unhandledRejection', err))
 
 // Two instances writing one SQLite file is a corruption risk — focus the first.
 if (!app.requestSingleInstanceLock()) {
   app.quit()
 } else {
   app.on('second-instance', () => {
-    if (!mainWindow) return
+    if (!mainWindow) {
+      if (db) createWindow()
+      return
+    }
     if (mainWindow.isMinimized()) mainWindow.restore()
     mainWindow.focus()
   })
@@ -789,7 +810,7 @@ if (!app.requestSingleInstanceLock()) {
           scheduleDailyBackups()
         })
         .catch((err) => reportFatal(MAIN_STRINGS[mainLocale()].initialIndex, err))
-      if (mainWindow) initAutoUpdate(mainWindow, readSettings().autoUpdate)
+      initAutoUpdate(liveWindow, readSettings().autoUpdate)
     })
   })
 }
@@ -799,7 +820,8 @@ app.on('window-all-closed', () => {
 })
 
 app.on('activate', () => {
-  if (BrowserWindow.getAllWindows().length === 0) createWindow()
+  // Without the DB (a startup dialog is up, or the app is closing) a window would be empty.
+  if (db && BrowserWindow.getAllWindows().length === 0) createWindow()
 })
 
 let shuttingDown = false
