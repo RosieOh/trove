@@ -13,9 +13,17 @@ which builds on `macos-latest` (Apple Silicon and Intel `dmg`/`zip`), `windows-l
 and publishes every artifact to a single GitHub Release.
 
 ```bash
-npm version patch          # bump package.json + create the vX.Y.Z commit and tag
+node scripts/assemble-changelog.mjs 0.7.0   # move changes/*.md into CHANGELOG.md as [0.7.0]
+git add CHANGELOG.md changes
+git commit -m "DOCS : 0.7.0 변경 기록을 모은다."
+npm version 0.7.0          # bump package.json + create the v0.7.0 commit and tag
 git push --follow-tags     # push the commit and the tag
 ```
+
+The first command is the only time a release's fragments are read together, so read the new
+section in `CHANGELOG.md` before committing and add an intro line if it needs one. It stops
+without changing anything if a fragment is malformed, the version already has a section, or
+nothing is pending. The commit comes first because `npm version` refuses a dirty tree.
 
 What the workflow does per OS:
 

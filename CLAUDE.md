@@ -16,6 +16,12 @@ This repository is the **Trove** Electron + React app. Use this file as a quick 
 - `src/` — React UI (Tailwind). `App.tsx` is the shell + search; tabs in `src/tabs/`, widgets in `src/components/`. Uses `window.vault` from preload; types in `src/vite-env.d.ts`.
 - `shared/` — JSONL parser + IPC DTOs imported by both main and renderer type-only paths.
 - `docs/` — PRD, architecture, ADRs, roadmap, release process.
+- `changes/` — one changelog fragment per branch; `scripts/assemble-changelog.mjs` moves them into `CHANGELOG.md` at release.
+
+## Parallel branches
+
+- **Don't edit `CHANGELOG.md`** — add `changes/<branch>.md` instead ([rules](changes/README.md)). `npm test` checks every fragment.
+- **Line-based barrels** (`**/features/index.ts`) merge with `merge=union`: keep one self-contained entry per line ([`.gitattributes`](.gitattributes)). Only local merges and rebases honour it. GitHub's merge API still answers 409, so rebase locally when GitHub reports a conflict there.
 
 ## Invariants
 
