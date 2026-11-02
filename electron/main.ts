@@ -728,8 +728,8 @@ const MAIN_STRINGS = {
     retryDetail: 'DB는 그대로 두었어요. 원인을 해결한 뒤 다시 시도해 주세요.\n\n{file}\n\n오류 코드: {code}',
     newerBuild: '이 색인 DB는 더 새로운 Trove에서 만들어졌어요.',
     newerBuildDetail: '이 버전은 스키마 v{known}까지만 읽을 수 있는데, DB는 v{version}이에요. DB는 건드리지 않았어요. 최신 Trove를 설치해 주세요.\n\n{file}',
-    readOnly: '데이터 폴더에 쓸 수 없어서 Trove를 시작하지 못했어요.',
-    readOnlyDetail: '이 폴더의 쓰기 권한을 확인한 뒤 다시 열어 주세요. 안의 파일은 바꾸지 않았어요.\n\n{file}',
+    cannotWrite: '데이터 폴더에 쓸 수 없어서 Trove를 시작하지 못했어요.',
+    cannotWriteDetail: '이 폴더의 쓰기 권한과 남은 디스크 공간을 확인한 뒤 다시 열어 주세요. 안의 파일은 바꾸지 않았어요.\n\n{file}\n\n오류 코드: {code}',
   },
   en: {
     fatal: 'Something went wrong.',
@@ -748,8 +748,8 @@ const MAIN_STRINGS = {
     retryDetail: 'The database was left as it is. Fix the cause, then try again.\n\n{file}\n\nError code: {code}',
     newerBuild: 'This index database was made by a newer version of Trove.',
     newerBuildDetail: 'This version reads up to schema v{known}, and the database is v{version}. It was not touched. Please install the latest Trove.\n\n{file}',
-    readOnly: 'Trove could not start because its data folder cannot be written to.',
-    readOnlyDetail: 'Check the write permission on this folder, then open Trove again. Nothing in it was changed.\n\n{file}',
+    cannotWrite: 'Trove could not start because its data folder cannot be written to.',
+    cannotWriteDetail: 'Check the write permission on this folder and the free disk space, then open Trove again. Nothing in it was changed.\n\n{file}\n\nError code: {code}',
   },
 } as const
 
@@ -830,28 +830,32 @@ function reportFatal(scope: string, err: unknown): Promise<unknown> | undefined 
 process.on('uncaughtException', (err) => void reportFatal('uncaughtException', err))
 process.on('unhandledRejection', (err) => void reportFatal('unhandledRejection', err))
 
-function userDataIsWritable(): boolean {
+/** Why the data folder cannot be written, or null if it can. Writes, as access(2) misses a full disk. */
+function userDataWriteError(): string | null {
+  const probe = path.join(app.getPath('userData'), `.write-check-${process.pid}`)
   try {
-    fs.accessSync(app.getPath('userData'), fs.constants.W_OK)
-    return true
-  } catch {
-    return false
+    fs.writeFileSync(probe, 'x')
+    fs.rmSync(probe, { force: true })
+    return null
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code ?? 'UNKNOWN'
   }
 }
 
 // Two instances writing one SQLite file is a corruption risk — focus the first.
 if (!app.requestSingleInstanceLock()) {
-  // Chromium also fails to take the lock when it cannot create the lock file. Quitting
-  // then would look like the app not starting at all.
-  if (userDataIsWritable()) app.quit()
+  // Chromium also fails to take the lock when it cannot create the lock file (a read-only
+  // folder, a full disk). Quitting then would look like the app not starting at all.
+  const writeError = userDataWriteError()
+  if (!writeError) app.quit()
   else {
     void app.whenReady().then(async () => {
       const s = MAIN_STRINGS[mainLocale()]
       await dialog.showMessageBox({
         type: 'error',
         title: APP_NAME,
-        message: s.readOnly,
-        detail: fillText(s.readOnlyDetail, { file: app.getPath('userData') }),
+        message: s.cannotWrite,
+        detail: fillText(s.cannotWriteDetail, { file: app.getPath('userData'), code: writeError }),
         buttons: [s.quit],
       })
       app.quit()
