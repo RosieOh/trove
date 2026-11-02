@@ -74,6 +74,10 @@ So this ADR changes in these ways:
   moved and returns failure. A failure later in recovery that is not about the backup puts
   the corrupt file back, so the next attempt starts over.
 - **A newer schema is refused:** a dialog, no write, no quarantine, no backup.
+- **A data folder that cannot be written says so.** A read-only folder or a completely
+  full disk stops Chromium creating its single-instance lock, which used to read as
+  "another instance is running": the app quit with no window and no message. Main now tries
+  a write there, and if it fails shows a dialog with the path and Quit.
 - **A migration needs its copy.** If the pre-migration copy fails, the DB is left as it is
   and the outcome is `retryable`, instead of logging and migrating anyway. Backups set to 0
   still means no copy.

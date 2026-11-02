@@ -138,8 +138,9 @@ Run `npm run poc` to see how your own corpus classifies.
 Index tables (derived, rebuildable except archived sessions):
 
 - `projects` — one row per source project; `tool`, `archived_at`.
-- `sessions` — one row per transcript file; `indexed_bytes`, `size_bytes`, `head_hash`,
-  `tail_hash`, `file_mtime_ms`, `message_count`, `archived_at`.
+- `sessions` — one row per transcript file, plus one per archived generation of a file that
+  came back different (`file_path` ends in `#archived-<ms>`); `indexed_bytes`, `size_bytes`,
+  `head_hash`, `tail_hash`, `file_mtime_ms`, `message_count`, `archived_at`.
 - `messages` — one row per non-blank line: body, kinds, class, timestamp, model, token
   columns (`input_tokens`, `output_tokens`, `cache_read_tokens`, `cache_creation_tokens`,
   `cache_creation_1h_tokens`), `msg_key`, `api_msg_id`, `request_id`, `is_prompt`,
@@ -203,10 +204,11 @@ deleting any. Snapshots are skipped below 1.2× the DB size of free space.
 Quarantine is all or nothing: a failed rename puts back what had moved and the outcome is
 `retryable`. So is a failure while installing a backup or creating the empty DB that is not
 about the backup, and the corrupt file is put back so the next attempt recovers it instead
-of finding no DB. The main process also shows a dialog with the path and Quit when a
-read-only data folder stops Chromium taking the single-instance lock, which happens before
-the DB is opened. Restore verifies first, then closes every connection, swaps the files and
-relaunches the app.
+of finding no DB. A read-only data folder or a completely full disk fails earlier, when
+Chromium cannot create its single-instance lock file. That looks the same as another
+instance holding the lock, so main tries a write in the folder to tell them apart, and shows
+a dialog with the path, the code and Quit if the write fails. Restore verifies first, then
+closes every connection, swaps the files and relaunches the app.
 
 Everything that sends to the renderer asks for the current window (`liveWindow`): on macOS
 the app and its workers outlive a closed window, and a later one can take its place.
