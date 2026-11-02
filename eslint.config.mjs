@@ -25,6 +25,12 @@ export default tseslint.config(
     languageOptions: { globals: { ...globals.node, ...globals.browser } },
   },
   {
+    // Preloaded with `electron -r`, which takes CommonJS.
+    files: ['tests/e2e/**/*.cjs'],
+    languageOptions: { globals: { ...globals.node } },
+    rules: { '@typescript-eslint/no-require-imports': 'off' },
+  },
+  {
     // Served as-is to the renderer before the bundle (pre-paint theme).
     files: ['public/**/*.js'],
     languageOptions: { globals: { ...globals.browser } },

@@ -4,14 +4,16 @@
  * first). Launches Electron with Playwright against a temporary copy of
  * `tests/e2e/fixtures`, drives the UI, and checks the promises unit tests cannot:
  * the window starts, the workers index, search / prompts / stats / plans / Codex work,
- * live updates and archiving react to file changes, the daily backup runs, the renderer
- * logs no errors, and the app writes nothing into the transcript folders.
+ * live updates and archiving react to file changes, indexing carries on with the window
+ * closed, the daily backup runs, the renderer logs no errors, the app writes nothing into
+ * the transcript folders, and a DB it must not touch is refused with a dialog.
  *
  *   npm run test:e2e            (Linux CI: xvfb-run -a npm run test:e2e)
  *
  * On failure a screenshot and the main-process log go to `e2e-artifacts/`.
  */
 import assert from 'node:assert/strict'
+import { spawn } from 'node:child_process'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
@@ -95,6 +97,40 @@ async function until(fn, { timeout = 20_000, interval = 200, what = 'condition' 
 const vault = (fn, arg) => page.evaluate(fn, arg)
 const nav = (re) => page.getByRole('button', { name: re }).first().click()
 
+function watchRenderer(p) {
+  p.on('console', (m) => m.type() === 'error' && rendererErrors.push(m.text()))
+  p.on('pageerror', (e) => rendererErrors.push(`pageerror: ${e.message}`))
+}
+
+/** Dialogs the main process has raised since launch (see the recorder installed below). */
+const dialogCalls = () => app.evaluate(() => globalThis.__e2eDialogs)
+
+/**
+ * Runs the app until it quits by itself, with every dialog recorded and answered by
+ * `record-dialogs.cjs`. For startups that end in a dialog, where there is no window for
+ * Playwright to drive and `whenReady` has passed before it could install anything.
+ */
+function launchToDialog(dataDir) {
+  const log = path.join(tmp, `dialogs-${path.basename(dataDir)}.jsonl`)
+  const stub = path.join(root, 'tests', 'e2e', 'record-dialogs.cjs')
+  return new Promise((resolve, reject) => {
+    const child = spawn(require('electron'), ['-r', stub, ...args], {
+      env: { ...env, VAULT_USER_DATA: dataDir, E2E_DIALOG_LOG: log },
+      stdio: 'ignore',
+    })
+    const timer = setTimeout(() => {
+      child.kill()
+      reject(new Error('the app did not quit after its dialog'))
+    }, 45_000)
+    child.on('error', reject)
+    child.on('exit', (code) => {
+      clearTimeout(timer)
+      const lines = fs.existsSync(log) ? fs.readFileSync(log, 'utf8').trim().split('\n').filter(Boolean) : []
+      resolve({ code, dialogs: lines.map((l) => JSON.parse(l)) })
+    })
+  })
+}
+
 let failed = false
 try {
   console.log('Trove e2e smoke test')
@@ -104,10 +140,21 @@ try {
     app.process().stdout?.on('data', (d) => mainLog.push(String(d)))
     app.process().stderr?.on('data', (d) => mainLog.push(String(d)))
     page = await app.firstWindow()
-    page.on('console', (m) => m.type() === 'error' && rendererErrors.push(m.text()))
-    page.on('pageerror', (e) => rendererErrors.push(`pageerror: ${e.message}`))
+    watchRenderer(page)
     await page.waitForLoadState('domcontentloaded')
     assert.equal(await page.title(), 'Trove')
+    // reportFatal raises showMessageBox and Electron's own handler raises showErrorBox, so
+    // record both: a dialog nobody answers would hang the run, and neither may appear.
+    await app.evaluate(({ dialog }) => {
+      globalThis.__e2eDialogs = []
+      for (const name of ['showErrorBox', 'showMessageBox']) {
+        dialog[name] = async (...a) => {
+          const box = a.find((x) => x?.message) ?? { message: a.join(' ') }
+          globalThis.__e2eDialogs.push({ name, message: box.message, detail: box.detail })
+          return { response: 0, checkboxChecked: false }
+        }
+      }
+    })
   })
 
   await step('initial index finishes on the workers', async () => {
@@ -201,6 +248,79 @@ try {
     )
   })
 
+  await step('with the window closed, indexing goes on and no error dialog appears', async () => {
+    const sameWord = 'closedwindowword'
+    // Windows and Linux quit when the last window closes; hold that for this step so it
+    // runs the path macOS users hit, where the app stays alive with no window.
+    await app.evaluate(({ app: a }) => {
+      globalThis.__e2eQuitOnClose = a.listeners('window-all-closed')
+      a.removeAllListeners('window-all-closed')
+      a.on('window-all-closed', () => {})
+    })
+    const closed = page.waitForEvent('close')
+    await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].close())
+    await closed
+
+    for (let i = 0; i < 3; i += 1) {
+      const line = {
+        type: 'user',
+        uuid: `e2e-closed-${i}`,
+        timestamp: '2026-10-04T11:00:00.000Z',
+        cwd: '/work/demo',
+        message: { role: 'user', content: [{ type: 'text', text: `${sameWord} line ${i}` }] },
+      }
+      fs.appendFileSync(sessionA, `${JSON.stringify(line)}\n`)
+    }
+    // No renderer to ask, so read the DB directly (WAL lets a second process do that).
+    const Database = require('better-sqlite3')
+    const indexed = () => {
+      const db = new Database(path.join(userData, 'vault.db'), { readonly: true, fileMustExist: true })
+      try {
+        return db.prepare(`SELECT COUNT(*) AS c FROM messages WHERE msg_key LIKE 'e2e-closed-%'`).get().c
+      } finally {
+        db.close()
+      }
+    }
+    await until(() => indexed() === 3, { timeout: 30_000, what: 'lines indexed with no window' })
+    // The "index changed" ping goes out right after the commit: give it time to arrive.
+    await new Promise((r) => setTimeout(r, 1500))
+    assert.deepEqual(await dialogCalls(), [])
+
+    // Back to one window, which must see the lines and get every later push.
+    const reopened = app.waitForEvent('window')
+    await app.evaluate(({ app: a }) => {
+      a.removeAllListeners('window-all-closed')
+      for (const l of globalThis.__e2eQuitOnClose) a.on('window-all-closed', l)
+      a.emit('activate')
+    })
+    page = await reopened
+    watchRenderer(page)
+    await page.waitForLoadState('domcontentloaded')
+    await until(
+      async () => (await vault((q) => window.vault.search({ query: q, limit: 5 }), sameWord))?.length === 3,
+      { what: 'closed-window lines in the reopened window' },
+    )
+    // The updater pushes to the window too: toggling it must reach this one, not the closed one.
+    await vault(() => window.vault.settingsSet({ autoUpdate: false }))
+    await vault(() => window.vault.settingsSet({ autoUpdate: true }))
+    assert.deepEqual(await dialogCalls(), [])
+  })
+
+  await step('a repeated failure raises one dialog, a different failure its own', async () => {
+    const shown = await app.evaluate(() => {
+      const repeated = new Error('e2e repeated failure')
+      process.emit('uncaughtException', repeated)
+      process.emit('uncaughtException', repeated)
+      process.emit('uncaughtException', new Error('e2e other failure'))
+      const calls = globalThis.__e2eDialogs.splice(0)
+      return calls.map((c) => [c.name, /e2e (repeated|other) failure/.exec(c.detail ?? '')?.[1]])
+    })
+    assert.deepEqual(shown, [
+      ['showMessageBox', 'repeated'],
+      ['showMessageBox', 'other'],
+    ])
+  })
+
   await step('the daily backup is written after the first scan', async () => {
     const info = await until(async () => {
       const b = await vault(() => window.vault.backupsList())
@@ -242,6 +362,46 @@ try {
     assert.deepEqual(changed, [])
     // Directory mtimes change when *we* add/remove files; any new entry would be listed above.
   })
+
+  await step('a DB from a newer build is refused with a dialog and left untouched', async () => {
+    const dataDir = path.join(tmp, 'user-newer')
+    fs.mkdirSync(dataDir)
+    const dbFile = path.join(dataDir, 'vault.db')
+    const Database = require('better-sqlite3')
+    const db = new Database(dbFile)
+    db.exec(`CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+      INSERT INTO meta VALUES ('schema_version', '9999');`)
+    db.close()
+    const bytes = fs.readFileSync(dbFile)
+
+    const { code, dialogs } = await launchToDialog(dataDir)
+    assert.equal(code, 0)
+    assert.equal(dialogs.length, 1, JSON.stringify(dialogs))
+    assert.match(dialogs[0].detail, /9999/)
+    assert.ok(dialogs[0].detail.includes(dbFile), dialogs[0].detail)
+    assert.equal(dialogs[0].buttons.length, 1, 'only a quit button')
+    assert.ok(fs.readFileSync(dbFile).equals(bytes), 'the DB changed')
+    assert.deepEqual(fs.readdirSync(dataDir).filter((f) => f.startsWith('vault.db') && f !== 'vault.db'), [])
+    assert.equal(fs.existsSync(path.join(dataDir, 'backups')), false)
+  })
+
+  // A chmod means nothing to Windows, and root ignores it.
+  if (process.platform !== 'win32' && process.getuid?.() !== 0) {
+    await step('a read-only data folder explains itself instead of quitting silently', async () => {
+      const dataDir = path.join(tmp, 'user-readonly')
+      fs.mkdirSync(dataDir)
+      fs.chmodSync(dataDir, 0o555)
+      try {
+        const { code, dialogs } = await launchToDialog(dataDir)
+        assert.equal(code, 0)
+        assert.equal(dialogs.length, 1, JSON.stringify(dialogs))
+        assert.ok(dialogs[0].detail.includes(dataDir), dialogs[0].detail)
+        assert.equal(dialogs[0].buttons.length, 1, 'only a quit button')
+      } finally {
+        fs.chmodSync(dataDir, 0o755)
+      }
+    })
+  }
 } catch {
   failed = true
   fs.mkdirSync(artifacts, { recursive: true })
