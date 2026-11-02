@@ -12,8 +12,10 @@ import {
   openVaultDbWithRecovery,
   pruneBackups,
   restoreBackup,
+  retryCause,
   verifyBackup,
   type OpenOutcome,
+  type OpenResult,
 } from './backup.js'
 import { claudeHomeDir, defaultClaudePlansRoot } from './claudeRoots.js'
 import { allAdapters } from './adapters.js'
@@ -712,36 +714,97 @@ const MAIN_STRINGS = {
   ko: {
     fatal: '예기치 못한 오류가 생겼어요.',
     continue: '계속',
+    retry: '다시 시도',
+    quit: '끝내기',
     initialIndex: '초기 색인',
     recovered: '색인 DB를 열 수 없어서 백업으로 되돌렸어요.',
     recoveredDetail: '{from} 백업을 썼어요. 그 뒤 바뀐 대화는 ~/.claude에서 다시 색인해요.\n\n열리지 않은 파일은 지우지 않고 남겨 뒀어요:\n{file}',
     rebuilt: '색인 DB를 열 수 없어서 새로 만들었어요.',
     rebuiltDetail: '쓸 수 있는 백업이 없었어요. ~/.claude에서 다시 색인해요. 보관돼 있던 대화와 즐겨찾기·태그는 아래 파일에 남아 있어요:\n{file}',
+    retryBusy: '다른 프로그램이 색인 DB를 쓰고 있어서 열지 못했어요.',
+    retryFull: '디스크 공간이 부족해서 색인 DB를 열지 못했어요.',
+    retryDenied: '이 폴더에 쓸 수 없어서 색인 DB를 열지 못했어요.',
+    retryOther: '색인 DB를 지금은 열 수 없어요.',
+    retryDetail: 'DB는 그대로 두었어요. 원인을 해결한 뒤 다시 시도해 주세요.\n\n{file}\n\n오류 코드: {code}',
+    newerBuild: '이 색인 DB는 더 새로운 Trove에서 만들어졌어요.',
+    newerBuildDetail: '이 버전은 스키마 v{known}까지만 읽을 수 있는데, DB는 v{version}이에요. DB는 건드리지 않았어요. 최신 Trove를 설치해 주세요.\n\n{file}',
+    readOnly: '데이터 폴더에 쓸 수 없어서 Trove를 시작하지 못했어요.',
+    readOnlyDetail: '이 폴더의 쓰기 권한을 확인한 뒤 다시 열어 주세요. 안의 파일은 바꾸지 않았어요.\n\n{file}',
   },
   en: {
     fatal: 'Something went wrong.',
     continue: 'Continue',
+    retry: 'Try again',
+    quit: 'Quit',
     initialIndex: 'initial indexing',
     recovered: 'The index database could not be opened, so a backup was restored.',
     recoveredDetail: 'Restored from {from}. Conversations changed since then are re-indexed from ~/.claude.\n\nThe file that failed to open was kept:\n{file}',
     rebuilt: 'The index database could not be opened, so a new one was created.',
     rebuiltDetail: 'No usable backup was found. Everything is re-indexed from ~/.claude. Archived conversations, favorites and tags are still in this file:\n{file}',
+    retryBusy: 'Another program is using the index database, so it could not be opened.',
+    retryFull: 'There is not enough disk space to open the index database.',
+    retryDenied: 'The index database could not be opened because this folder cannot be written to.',
+    retryOther: 'The index database cannot be opened right now.',
+    retryDetail: 'The database was left as it is. Fix the cause, then try again.\n\n{file}\n\nError code: {code}',
+    newerBuild: 'This index database was made by a newer version of Trove.',
+    newerBuildDetail: 'This version reads up to schema v{known}, and the database is v{version}. It was not touched. Please install the latest Trove.\n\n{file}',
+    readOnly: 'Trove could not start because its data folder cannot be written to.',
+    readOnlyDetail: 'Check the write permission on this folder, then open Trove again. Nothing in it was changed.\n\n{file}',
   },
 } as const
 
+/** Fills `{name}` placeholders. Paths are arbitrary text, so `$` must stay literal. */
+function fillText(text: string, values: Record<string, string | number>): string {
+  return text.replace(/\{(\w+)\}/g, (whole, name: string) => String(values[name] ?? whole))
+}
+
 /** Tells the user when startup had to restore or rebuild the DB (it used to happen silently). */
 function reportOpenOutcome(outcome: OpenOutcome) {
-  if (outcome.kind === 'ok' || !mainWindow) return
+  const win = liveWindow()
+  if (outcome.kind === 'ok' || !win) return
   const s = MAIN_STRINGS[mainLocale()]
-  const fill = (text: string) =>
-    text.replace('{file}', outcome.quarantined).replace('{from}', outcome.kind === 'recovered' ? outcome.from : '')
-  void dialog.showMessageBox(mainWindow, {
+  const values = { file: outcome.quarantined, from: outcome.kind === 'recovered' ? outcome.from : '' }
+  void dialog.showMessageBox(win, {
     type: outcome.kind === 'recovered' ? 'info' : 'warning',
     title: APP_NAME,
     message: outcome.kind === 'recovered' ? s.recovered : s.rebuilt,
-    detail: fill(outcome.kind === 'recovered' ? s.recoveredDetail : s.rebuiltDetail),
+    detail: fillText(outcome.kind === 'recovered' ? s.recoveredDetail : s.rebuiltDetail, values),
     buttons: [s.continue],
   })
+}
+
+/**
+ * Opens the vault DB, asking the user when it cannot be opened yet. These dialogs come
+ * before any window: without the DB there is nothing a window could show. Null means quit.
+ */
+async function openVaultDbOrAsk(): Promise<Extract<OpenResult, { db: DbHandle }> | null> {
+  for (;;) {
+    const opened = openVaultDbWithRecovery(vaultDbPath(), backupsDir())
+    if (opened.db) return opened
+    const { outcome } = opened
+    const s = MAIN_STRINGS[mainLocale()]
+    if (outcome.kind === 'newer-build') {
+      await dialog.showMessageBox({
+        type: 'warning',
+        title: APP_NAME,
+        message: s.newerBuild,
+        detail: fillText(s.newerBuildDetail, { known: outcome.known, version: outcome.version, file: vaultDbPath() }),
+        buttons: [s.quit],
+      })
+      return null
+    }
+    const messages = { busy: s.retryBusy, full: s.retryFull, denied: s.retryDenied, other: s.retryOther }
+    const { response } = await dialog.showMessageBox({
+      type: 'warning',
+      title: APP_NAME,
+      message: messages[retryCause(outcome.code)],
+      detail: fillText(s.retryDetail, { file: vaultDbPath(), code: outcome.code }),
+      buttons: [s.retry, s.quit],
+      defaultId: 0,
+      cancelId: 1,
+    })
+    if (response !== 0) return null
+  }
 }
 
 /** Dialogs already raised, so a failure that repeats (on every index update, say) raises one. */
@@ -767,9 +830,33 @@ function reportFatal(scope: string, err: unknown): Promise<unknown> | undefined 
 process.on('uncaughtException', (err) => void reportFatal('uncaughtException', err))
 process.on('unhandledRejection', (err) => void reportFatal('unhandledRejection', err))
 
+function userDataIsWritable(): boolean {
+  try {
+    fs.accessSync(app.getPath('userData'), fs.constants.W_OK)
+    return true
+  } catch {
+    return false
+  }
+}
+
 // Two instances writing one SQLite file is a corruption risk — focus the first.
 if (!app.requestSingleInstanceLock()) {
-  app.quit()
+  // Chromium also fails to take the lock when it cannot create the lock file. Quitting
+  // then would look like the app not starting at all.
+  if (userDataIsWritable()) app.quit()
+  else {
+    void app.whenReady().then(async () => {
+      const s = MAIN_STRINGS[mainLocale()]
+      await dialog.showMessageBox({
+        type: 'error',
+        title: APP_NAME,
+        message: s.readOnly,
+        detail: fillText(s.readOnlyDetail, { file: app.getPath('userData') }),
+        buttons: [s.quit],
+      })
+      app.quit()
+    })
+  }
 } else {
   app.on('second-instance', () => {
     if (!mainWindow) {
@@ -780,9 +867,13 @@ if (!app.requestSingleInstanceLock()) {
     mainWindow.focus()
   })
 
-  app.whenReady().then(() => {
+  app.whenReady().then(async () => {
     plansRoot = defaultClaudePlansRoot()
-    const opened = openVaultDbWithRecovery(vaultDbPath(), backupsDir())
+    const opened = await openVaultDbOrAsk()
+    if (!opened) {
+      app.quit()
+      return
+    }
     db = opened.db
     noteAppOpen()
     app.on('browser-window-focus', noteAppOpen)
@@ -812,6 +903,10 @@ if (!app.requestSingleInstanceLock()) {
         .catch((err) => reportFatal(MAIN_STRINGS[mainLocale()].initialIndex, err))
       initAutoUpdate(liveWindow, readSettings().autoUpdate)
     })
+  }).catch(async (err) => {
+    // No window will follow: say why, then leave rather than stay running with nothing to show.
+    await reportFatal('startup', err)
+    app.quit()
   })
 }
 

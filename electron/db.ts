@@ -7,16 +7,23 @@ export type DbHandle = Database.Database
 
 export const SCHEMA_VERSION = 10
 
+/** The file was written by a newer build. This build cannot know what a write would break. */
+export class NewerSchemaError extends Error {
+  constructor(readonly version: number) {
+    super(`database is schema v${version}; this build knows up to v${SCHEMA_VERSION}`)
+  }
+}
+
 /**
  * Opens the vault DB. Only the main process migrates (`migrate: true`, before the
  * index worker starts); the worker opens the already-migrated file.
  */
-export function openVaultDb(dbFile: string, opts: { migrate?: boolean } = {}): DbHandle {
+export function openVaultDb(dbFile: string, opts: { migrate?: boolean; busyTimeoutMs?: number } = {}): DbHandle {
   const dir = path.dirname(dbFile)
   fs.mkdirSync(dir, { recursive: true })
   // Two connections share this file (main for queries/user writes, the index worker
   // for bulk writes). Wait for the other's short write transactions instead of failing.
-  const db = new Database(dbFile, { timeout: 10_000 })
+  const db = new Database(dbFile, { timeout: opts.busyTimeoutMs ?? 10_000 })
   try {
     db.pragma('journal_mode = WAL')
     // WAL + NORMAL never corrupts; at worst the last transactions before a power loss
@@ -270,6 +277,7 @@ export function readSchemaVersion(db: DbHandle): number {
 
 function migrate(db: DbHandle) {
   const v = readSchemaVersion(db)
+  if (v > SCHEMA_VERSION) throw new NewerSchemaError(v)
   if (v > 0 && v < 9) migrateLegacyToV9(db)
   else if (v === 0 && tableExists(db, 'messages')) migrateLegacyToV9(db)
   // Superseded by the covering idx_messages_usage_cover (early v9 builds created it).
