@@ -4,7 +4,7 @@ dist-electron
 release
 .DS_Store
 *.log
-tsconfig.node.tsbuildinfo
+*.tsbuildinfo
 .vscode/*
 !.vscode/extensions.json
 
