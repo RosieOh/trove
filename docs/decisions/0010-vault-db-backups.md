@@ -58,8 +58,12 @@ migrations planned next would make each case worse:
 - A healthy DB under a 14 s write lock was quarantined and replaced by a backup. On a full
   disk the real DB ended up in `vault.db.corrupt-*`, and the next launch opened an empty
   one and reported `ok`.
+- A failed restore or a crash during recovery left no `vault.db`, with the same result: an
+  empty DB, `ok`, no dialog, and later dailies of it rotating out the good ones.
 - A failed quarantine rename fell back to deleting the file.
 - A DB written by a newer build opened as `ok`, running old code on new data.
+- A read-only `vault.db` opened as `ok`, because SQLite falls back to a read-only handle and
+  a current schema writes nothing at open. Indexing and daily backups then never ran.
 - With a keep count of 3, three dailies rotated out the manual, pre-purge and
   pre-migration copies, so a migration bug noticed three days later had no rollback.
 
@@ -73,14 +77,25 @@ So this ADR changes in these ways:
 - **Quarantine is all or nothing and never deletes.** A failed rename puts back what had
   moved and returns failure. A failure later in recovery that is not about the backup puts
   the corrupt file back, so the next attempt starts over.
+- **No DB is a first launch only when nothing says there was one.** With a backup or a
+  `.corrupt-*` file around, the DB went missing, so the newest usable backup is installed
+  and the user is told, as for damage. The cost: someone who deletes `vault.db` by hand to
+  start over gets it back from a backup, with a dialog, until they delete the backups too.
+  That is the same trade as above. A failed restore also moves the old DB back.
 - **A newer schema is refused:** a dialog, no write, no quarantine, no backup.
 - **A data folder that cannot be written says so.** A read-only folder or a completely
   full disk stops Chromium creating its single-instance lock, which used to read as
   "another instance is running": the app quit with no window and no message. Main now tries
   a write there, and if it fails shows a dialog with the path and Quit.
+- **A DB that cannot be written is not opened.** The DB file and its sidecars are checked
+  first and the open makes a real write and rolls it back, so the outcome is `retryable`
+  with the path. The check comes first because a read-only handle leaves sidecars with the
+  file's mode behind, which would fail the retry after the user fixes the file. The write
+  also means a write lock held at startup is reported at once.
 - **A migration needs its copy.** If the pre-migration copy fails, the DB is left as it is
-  and the outcome is `retryable`, instead of logging and migrating anyway. Backups set to 0
-  still means no copy.
+  and the outcome is `retryable` with the backup folder as its path, instead of logging and
+  migrating anyway. If the version cannot be read first, the open does not run either, since
+  nothing could tell whether it would migrate. Backups set to 0 still means no copy.
 - **Only dailies rotate by the keep count.** The latest 2 of each of manual, pre-purge,
   pre-migration and pre-restore are kept apart from it. The plan named the first three;
   pre-restore is included because it is the only undo of a restore, and leaving it out
@@ -90,6 +105,7 @@ Disk use by default is still about 3× the DB size, and at most 11× once every 
 safety copy exists twice (≈8.8 GB on the audited machine). Those copies only exist after
 the user or an upgrade caused them, and Settings shows the total.
 
-Separately, in [ADR-0006](0006-stable-keys-append-indexing-archive.md) terms, a file that
-comes back with different content no longer replaces the rows it would have replaced: see
-"A file that comes back different" in `docs/architecture.md`.
+Separately, in [ADR-0006](0006-stable-keys-append-indexing-archive.md) terms, a file or plan
+that comes back with different content no longer replaces the rows it would have replaced,
+and mirror mode no longer removes archived rows when a project folder goes: see "Archive"
+and "A file that comes back different" in `docs/architecture.md`.

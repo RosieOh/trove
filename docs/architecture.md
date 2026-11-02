@@ -85,15 +85,21 @@ See [ADR-0006](decisions/0006-stable-keys-append-indexing-archive.md).
   `archiveMode = keep`, the default) or is deleted (`mirror`). Reconciliation is skipped
   for an adapter whose root is missing, and a watcher deletion event under a root that no
   longer exists is ignored. Plans (`plan_files.archived_at`) follow the same mode and the
-  same guard. Purging archived rows (sessions and plans) is an explicit action.
+  same guard. Purging archived rows (sessions and plans) is an explicit action, and nothing
+  else removes them: mirror mode only drops live rows, and a project folder that goes while
+  the project holds an archived session leaves the project archived, in either mode.
 - **A file that comes back different.** When the fingerprints do not match an archived
   session (either mode) or a live one in Keep mode, the old row is renamed to
   `<file_path>#archived-<ms>` (`rel_path` gets the same suffix), keeps its messages and is
   marked archived, and the file gets a new session row. Renaming is one `UPDATE`; moving
   the messages to a new row would rewrite each one through the FTS triggers. Lines that
   kept their uuid then exist in both generations, so search shows both, like a forked
-  session. Mirror mode replaces a live session's rows in place, and so does a row reset by
-  `requestFullReparse` (`head_hash` NULL) and a row with no messages.
+  session. Stats count those lines once (see Cost estimation). Mirror mode replaces a live
+  session's rows in place, and so does a row reset by `requestFullReparse` (`head_hash`
+  NULL) and a row with no messages. An archived plan works the same way, compared by content
+  because plans have no fingerprints: the same body makes it live again, any other is a new
+  row and the old one moves to `<file_path>#archived-<ms>`. A live plan is a document people
+  edit, so a new version replaces its row.
 - **Live updates.** chokidar v4 watches the roots (globs were removed in v4), filters
   `.jsonl` / `.md`, and the main process forwards batched events every 300 ms.
 - **Adapters** (`electron/adapters.ts`) provide `listProjects`, `listSessions`,
@@ -196,19 +202,36 @@ deleting any. Snapshots are skipped below 1.2× the DB size of free space.
 | Outcome | When | What happens |
 |---------|------|--------------|
 | `ok` | The DB opened | |
-| `recovered` | `SQLITE_CORRUPT` / `SQLITE_NOTADB` | Quarantined (`vault.db.corrupt-<time>`), newest backup that passes `verifyBackup` installed (`quick_check`, a vault schema no newer than `SCHEMA_VERSION`), dialog |
-| `rebuilt` | The same, and no backup passes | Quarantined, empty DB created, dialog |
-| `retryable` + code | Anything else: busy, disk full, permissions | No DB handle, no file swapped; dialog with the path, the code, Try again and Quit |
+| `recovered` | `SQLITE_CORRUPT` / `SQLITE_NOTADB`, or no DB while a backup or a quarantined file exists | Quarantined (`vault.db.corrupt-<time>`) if there was a file, newest backup that passes `verifyBackup` installed (`quick_check`, a vault schema no newer than `SCHEMA_VERSION`), dialog |
+| `rebuilt` | The same, and no backup passes | Quarantined if there was a file, empty DB created, dialog |
+| `retryable` + code + path | Anything else: busy, disk full, permissions | No DB handle, no file swapped; dialog with the path that failed (the backup folder when the pre-migration copy failed), the code, Try again and Quit |
 | `newer-build` | Schema above `SCHEMA_VERSION` | No DB handle, no write; dialog with the versions, the path and Quit |
+
+No DB and nothing to say there ever was one is a first launch, which is `ok`.
+
+Before opening, a read-only connection reads the schema version and the backup setting. If
+that read fails the DB is not opened: corruption goes to recovery, anything else (a lock
+that outlasts its timeout, say) is `retryable`, because without the version nothing could
+tell whether the open would migrate. A file with tables and no version counts as a migration
+too, since the legacy path rebuilds it. A file with no tables needs no copy.
+
+A DB file or sidecar that cannot be written is `retryable` before SQLite touches it. SQLite
+would open it read-only without saying so, and leave sidecars with the file's mode that fail
+the retry even after the user fixes the DB. The open then makes a real write and rolls it
+back (`CREATE TABLE` in a transaction; on a read-only handle `BEGIN IMMEDIATE` alone starts a
+read transaction), which also reports a write lock here rather than at the first scan.
 
 Quarantine is all or nothing: a failed rename puts back what had moved and the outcome is
 `retryable`. So is a failure while installing a backup or creating the empty DB that is not
-about the backup, and the corrupt file is put back so the next attempt recovers it instead
-of finding no DB. A read-only data folder or a completely full disk fails earlier, when
+about the backup, and the corrupt file is put back so the next attempt recovers it. A crash
+or a power cut in that window leaves a quarantined file and no DB, which the next launch
+treats as a recovery. A read-only data folder or a completely full disk fails earlier, when
 Chromium cannot create its single-instance lock file. That looks the same as another
 instance holding the lock, so main tries a write in the folder to tell them apart, and shows
 a dialog with the path, the code and Quit if the write fails. Restore verifies first, then
-closes every connection, swaps the files and relaunches the app.
+closes every connection, swaps the files and relaunches the app. If the copy cannot be
+installed the old DB moves back and a dialog says so before the relaunch; if even that
+fails, the next launch finds no DB and recovers from the `pre-restore` file, which is newest.
 
 Everything that sends to the renderer asks for the current window (`liveWindow`): on macOS
 the app and its workers outlive a closed window, and a later one can take its place.
@@ -243,7 +266,13 @@ occurrence for open/favorite/tag. Substring filter; recent or most-used order.
 Token usage is counted **once per API response**: Claude Code writes one line per content
 block and repeats `usage` on each (later lines carry the final `output_tokens`), so stats
 group by `(api_msg_id, request_id)` and take each field's maximum. On a real corpus naive
-line sums were 2.16× too high.
+line sums were 2.16× too high. A line with no response id counts once per `msg_key`.
+
+Every other count on the Stats tab is by line too, not by row: a forked session and an
+archived generation hold the same line more than once. Totals read `idx_messages_key`,
+prompts their partial index, and role counts take the repeated rows back off the covering
+`idx_messages_class_role`. On a synthetic 750k rows (617 MB), warm: 63 ms when counting rows,
+155 ms now with no line repeated, 270 ms with 5% of lines repeated, 610 ms with 25%.
 
 `shared/pricing.ts` prices the result:
 
@@ -293,7 +322,9 @@ helpers in `src/format.ts`. The visual system — tokens and glass component cla
   delete, indexing with the window closed and the daily backup. It also checks that the
   renderer logs no errors, that the app quits cleanly and that nothing was written under
   the transcript roots. Startups that end in a dialog (a newer-build DB, a read-only data
-  folder) run without Playwright, with `tests/e2e/record-dialogs.cjs` answering the dialog.
+  folder, DB file or backup folder) run without Playwright, with
+  `tests/e2e/record-dialogs.cjs` answering with the last button. A DB that went missing runs
+  with both, since the app stays open after telling the user.
   CI runs it on macOS, Windows and Linux (`xvfb-run`, `--no-sandbox`).
 
 ## Packaging
