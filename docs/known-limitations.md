@@ -31,7 +31,9 @@ automatic backups off (ADR-0010).
 
 A session file that is rewritten or shrinks keeps its old rows as an archived session, so a
 tool that rewrites a transcript again and again adds a full copy each time, and lines that
-survive the rewrite show up twice in search until the archive is purged.
+survive the rewrite show up twice in search until the archive is purged. Stats count those
+lines once. A line with no uuid is keyed by its position, so it counts again if the rewrite
+moved it.
 
 ## Codex CLI support is best effort
 
