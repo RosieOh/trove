@@ -6,6 +6,7 @@ import { requestFullReparse, setSetting } from '../../electron/db'
 import {
   addFavorite,
   listFavorites,
+  listProjects,
   listPrompts,
   purgeArchived,
   recentSessions,
@@ -141,6 +142,43 @@ describe('archive vs mirror when Claude Code deletes a transcript', () => {
     fs.rmSync(sb.projectsRoot, { recursive: true })
     expect(reconcileMissing(db, sb.adapter, 'mirror')).toBe(0)
     expect(db.prepare(`SELECT COUNT(*) AS c FROM sessions`).get()).toEqual({ c: 1 })
+  })
+
+  it('mirror mode keeps what was archived when the whole project folder goes', async () => {
+    const sb = sandbox()
+    const db = sb.open()
+    const pid = sb.project(db)
+    const old = path.join(sb.projectRoot, 'old.jsonl')
+    const live = path.join(sb.projectRoot, 'live.jsonl')
+    writeLines(old, [userLine('u1', 'kept only in the vault')])
+    writeLines(live, [userLine('u2', 'still on disk')])
+    await indexSessionFile(db, { projectId: pid, projectRoot: sb.projectRoot, filePath: old })
+    await indexSessionFile(db, { projectId: pid, projectRoot: sb.projectRoot, filePath: live })
+    fs.rmSync(old)
+    reconcileMissing(db, sb.adapter, 'keep')
+
+    fs.rmSync(sb.projectRoot, { recursive: true })
+    // The live session and the project: the archived session is neither.
+    expect(reconcileMissing(db, sb.adapter, 'mirror')).toBe(2)
+    expect(db.prepare(`SELECT file_path AS file FROM sessions`).all()).toEqual([{ file: old }])
+    expect(unifiedSearch(db, { query: 'vault' })).toHaveLength(1)
+    expect(listProjects(db)).toMatchObject([{ id: pid, archived: true, archivedCount: 1 }])
+    // Nothing more to do on the next scan, and the purge still removes it all.
+    expect(reconcileMissing(db, sb.adapter, 'mirror')).toBe(0)
+    expect(purgeArchived(db)).toBe(1)
+    expect(listProjects(db)).toEqual([])
+  })
+
+  it('mirror mode drops a project folder that went with nothing archived', async () => {
+    const sb = sandbox()
+    const db = sb.open()
+    const pid = sb.project(db)
+    const file = path.join(sb.projectRoot, 's.jsonl')
+    writeLines(file, [userLine('u1', 'x')])
+    await indexSessionFile(db, { projectId: pid, projectRoot: sb.projectRoot, filePath: file })
+    fs.rmSync(sb.projectRoot, { recursive: true })
+    expect(reconcileMissing(db, sb.adapter, 'mirror')).toBe(2)
+    expect(listProjects(db)).toEqual([])
   })
 })
 
