@@ -73,13 +73,38 @@ type SessionState = {
 
 export type IndexFileResult = { added: number; mode: 'skip' | 'append' | 'full' }
 
+/** True when the file still holds the bytes this row was indexed from, plus maybe more. */
+function hasOnlyGrown(row: SessionState, filePath: string, size: number): boolean {
+  if (row.indexed_bytes <= 0 || !row.head_hash || size < row.indexed_bytes) return false
+  const fp = fingerprint(filePath, row.indexed_bytes)
+  return fp.head === row.head_hash && fp.tail === row.tail_hash
+}
+
+/**
+ * Takes a session's row out of the way of the file now at its path. Its messages stay
+ * where they are, archived under a path no file can have; repointing them at a new row
+ * would rewrite every message through the FTS triggers for the same result.
+ */
+function setAsideSession(db: DbHandle, row: SessionState, filePath: string) {
+  const taken = db.prepare(`SELECT 1 FROM sessions WHERE file_path = ?`)
+  const now = Date.now()
+  let ts = now
+  while (taken.get(`${filePath}#archived-${ts}`)) ts += 1
+  const suffix = `#archived-${ts}`
+  db.prepare(
+    `UPDATE sessions SET file_path = ?, rel_path = rel_path || ?, archived_at = COALESCE(archived_at, ?) WHERE id = ?`,
+  ).run(filePath + suffix, suffix, now, row.id)
+}
+
 /**
  * Index one transcript file. Claude Code only ever appends to a session file, so a
  * file whose first bytes and whose bytes before the last indexed offset are unchanged
  * is resumed from that offset — an active 400 MB session costs a few new lines per
- * update instead of a full re-read. Anything else (shrunk, rewritten, stateful format)
- * is re-read from the start; message rows are replaced but user data keyed on
- * `msg_key` is untouched.
+ * update instead of a full re-read. A stateful format that has only grown is re-read in
+ * place. Any other file at this path is different content: its rows may be the only copy
+ * left, so an archived session (and, in Keep mode, a live one) is set aside and the file
+ * becomes a session of its own. Mirror mode replaces a live session's rows, and rows reset
+ * by `requestFullReparse` are re-read in place. User data keyed on `msg_key` is untouched.
  */
 export async function indexSessionFile(
   db: DbHandle,
@@ -109,24 +134,32 @@ export async function indexSessionFile(
     )
     .get(filePath) as SessionState | undefined
 
+  // The common case on every scan: a live file that has not changed needs no hashing. An
+  // archived row has to prove the file is the same one first, even at the same size and mtime.
+  if (row && row.archived_at == null && row.indexed_bytes > 0 && row.indexed_bytes === size && row.file_mtime_ms === mtime) {
+    return { added: 0, mode: 'skip' }
+  }
+
+  const grown = row != null && hasOnlyGrown(row, filePath, size)
+  if (row && !grown && row.message_count > 0) {
+    const fingerprinted = row.indexed_bytes > 0 && row.head_hash != null
+    if (row.archived_at != null || (fingerprinted && archiveModeOf(db) === 'keep')) {
+      setAsideSession(db, row, filePath)
+      row = undefined
+    }
+  }
   if (row && row.archived_at != null) {
     // The source came back; it is live again.
     db.prepare(`UPDATE sessions SET archived_at = NULL WHERE id = ?`).run(row.id)
-  }
-  if (row && row.indexed_bytes > 0 && row.indexed_bytes === size && row.file_mtime_ms === mtime) {
-    return { added: 0, mode: 'skip' }
   }
 
   let start = 0
   let lineIndex = 0
   let mode: IndexFileResult['mode'] = 'full'
-  if (row && appendable && row.indexed_bytes > 0 && size >= row.indexed_bytes && row.head_hash) {
-    const fp = fingerprint(filePath, row.indexed_bytes)
-    if (fp.head === row.head_hash && fp.tail === row.tail_hash) {
-      start = row.indexed_bytes
-      lineIndex = row.message_count
-      mode = 'append'
-    }
+  if (row && appendable && grown) {
+    start = row.indexed_bytes
+    lineIndex = row.message_count
+    mode = 'append'
   }
   if (mode === 'append' && start === size) {
     db.prepare(`UPDATE sessions SET file_mtime_ms = ? WHERE id = ?`).run(mtime, row!.id)
