@@ -6,7 +6,8 @@
  * the window starts, the workers index, search / prompts / stats / plans / Codex work,
  * live updates and archiving react to file changes, indexing carries on with the window
  * closed, the daily backup runs, the renderer logs no errors, the app writes nothing into
- * the transcript folders, and a DB it must not touch is refused with a dialog.
+ * the transcript folders, an older DB upgrades with its archive intact, and a DB it must not
+ * touch is refused with a dialog.
  *
  *   npm run test:e2e            (Linux CI: xvfb-run -a npm run test:e2e)
  *
@@ -353,6 +354,18 @@ try {
     app = null
   })
 
+  await step('the built app ran every file in electron/migrations', async () => {
+    const ids = fs.readdirSync(path.join(root, 'electron', 'migrations')).map((f) => Number(f.slice(0, 4))).sort((a, b) => a - b)
+    assert.ok(ids.length > 0)
+    const Database = require('better-sqlite3')
+    const db = new Database(path.join(userData, 'vault.db'), { readonly: true })
+    const applied = db.prepare(`SELECT id FROM schema_migrations ORDER BY id`).all().map((r) => r.id)
+    const { value } = db.prepare(`SELECT value FROM meta WHERE key = 'schema_version'`).get()
+    db.close()
+    assert.deepEqual(applied, ids)
+    assert.equal(Number(value), ids.at(-1))
+  })
+
   await step('nothing was written under the transcript roots', async () => {
     const after = snapshotTree([claudeHome, codexHome])
     const touched = new Set([sessionA, sessionB, planFile].map((p) => path.relative(tmp, p)))
@@ -382,6 +395,62 @@ try {
     assert.equal(dialogs[0].buttons.length, 1, 'only a quit button')
     assert.ok(fs.readFileSync(dbFile).equals(bytes), 'the DB changed')
     assert.deepEqual(fs.readdirSync(dataDir).filter((f) => f.startsWith('vault.db') && f !== 'vault.db'), [])
+    assert.equal(fs.existsSync(path.join(dataDir, 'backups')), false)
+  })
+
+  /** A v10 DB as it shipped, one archived line in it, ready for `edit` to adjust. */
+  function shippedV10(dataDir, edit = '') {
+    fs.mkdirSync(dataDir)
+    const dbFile = path.join(dataDir, 'vault.db')
+    const Database = require('better-sqlite3')
+    const db = new Database(dbFile)
+    db.exec(fs.readFileSync(path.join(root, 'tests', 'db', 'fixtures', 'schema-v10.sql'), 'utf8'))
+    db.exec(`INSERT INTO meta VALUES ('schema_version', '10');
+      INSERT INTO projects (id, slug, root_path, display_name) VALUES (1, '-gone', '/gone', '/gone');
+      INSERT INTO sessions (id, project_id, rel_path, file_path, file_mtime_ms, message_count, archived_at)
+        VALUES (1, 1, 's.jsonl', '/gone/s.jsonl', 1, 1, 1);
+      INSERT INTO messages (session_id, line_index, role, body, msg_key) VALUES (1, 0, 'user', 'upgradesentinel', 'k1');
+      ${edit}`)
+    db.close()
+    return dbFile
+  }
+
+  await step('a v10 DB upgrades in the built app, after its copy, with its archive intact', async () => {
+    const dataDir = path.join(tmp, 'user-v10')
+    const dbFile = shippedV10(dataDir)
+    app = await _electron.launch({ executablePath: require('electron'), args, env: { ...env, VAULT_USER_DATA: dataDir }, timeout: 60_000 })
+    page = await app.firstWindow()
+    await until(async () => {
+      const hits = await vault(() => window.vault.search({ query: 'upgradesentinel', limit: 5 }))
+      return hits?.length === 1 && hits[0].archived === true
+    }, { timeout: 30_000, what: 'the archived line in the upgraded DB' })
+    await app.close()
+    app = null
+
+    const Database = require('better-sqlite3')
+    const db = new Database(dbFile, { readonly: true })
+    const { value } = db.prepare(`SELECT value FROM meta WHERE key = 'schema_version'`).get()
+    assert.ok(Number(value) > 10, `still at v${value}`)
+    assert.ok(db.prepare(`SELECT 1 FROM schema_migrations WHERE id = 11`).get(), 'the first step has no record')
+    db.close()
+    const copies = fs.readdirSync(path.join(dataDir, 'backups')).filter((f) => f.endsWith('-pre-migration.db'))
+    assert.equal(copies.length, 1, 'one copy before the upgrade')
+    const copy = new Database(path.join(dataDir, 'backups', copies[0]), { readonly: true })
+    assert.equal(copy.prepare(`SELECT value FROM meta WHERE key = 'schema_version'`).get().value, '10')
+    copy.close()
+  })
+
+  await step('a DB holding a migration this build does not know is refused and left untouched', async () => {
+    const dataDir = path.join(tmp, 'user-unknown-id')
+    const dbFile = shippedV10(dataDir, `CREATE TABLE schema_migrations (id INTEGER PRIMARY KEY, applied_at INTEGER);
+      INSERT INTO schema_migrations VALUES (11, 1), (9998, 1);`)
+    const bytes = fs.readFileSync(dbFile)
+    const { code, dialogs } = await launchToDialog(dataDir)
+    assert.equal(code, 0)
+    assert.equal(dialogs.length, 1, JSON.stringify(dialogs))
+    assert.match(dialogs[0].detail, /9998/)
+    assert.equal(dialogs[0].buttons.length, 1, 'only a quit button')
+    assert.ok(fs.readFileSync(dbFile).equals(bytes), 'the DB changed')
     assert.equal(fs.existsSync(path.join(dataDir, 'backups')), false)
   })
 
