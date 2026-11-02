@@ -19,14 +19,16 @@ import type { UpdateStatus } from '../shared/ipc.js'
  */
 
 let status: UpdateStatus = { state: 'idle' }
-let win: BrowserWindow | null = null
+/** Asked on every push: the window can close, and a later one can take its place. */
+let getWindow: (() => BrowserWindow | null) | null = null
 let enabled = true
 let timer: ReturnType<typeof setInterval> | null = null
 let wired = false
 
 function push(next: UpdateStatus) {
   status = next
-  win?.webContents.send(IPC.onUpdateStatus, next)
+  const win = getWindow?.()
+  if (win && !win.isDestroyed()) win.webContents.send(IPC.onUpdateStatus, next)
 }
 
 export function getUpdateStatus(): UpdateStatus {
@@ -85,8 +87,8 @@ function load(): Updater | null {
   }
 }
 
-export function initAutoUpdate(browserWindow: BrowserWindow, isEnabled: boolean): void {
-  win = browserWindow
+export function initAutoUpdate(currentWindow: () => BrowserWindow | null, isEnabled: boolean): void {
+  getWindow = currentWindow
   enabled = isEnabled
   if (!updatesSupported()) {
     push({ state: 'unsupported' })
@@ -144,7 +146,7 @@ export function setAutoUpdateEnabled(next: boolean): void {
     if (status.state !== 'ready') push({ state: updatesSupported() ? 'disabled' : 'unsupported' })
     return
   }
-  if (win) initAutoUpdate(win, true)
+  if (getWindow) initAutoUpdate(getWindow, true)
 }
 
 export async function checkForUpdates(): Promise<UpdateStatus> {
