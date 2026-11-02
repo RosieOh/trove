@@ -30,6 +30,8 @@ the starred body, so it survives even if the line leaves the index.
 stores `indexed_bytes` plus SHA-1 fingerprints of the file's first 4 KB and of the 256
 bytes before `indexed_bytes`. If both still match, only bytes after the offset are
 parsed; otherwise the file is re-read from 0 (row ids change, user data does not).
+(Amended 2026-11-02: in Keep mode a re-read no longer replaces the old rows, which stay as
+an archived session. See `docs/architecture.md`.)
 Files are read in 4 MB chunks, rows are written in transactions of 2,000 lines, and a
 trailing line without `\n` that does not parse yet is left for the next event.
 

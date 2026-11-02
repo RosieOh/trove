@@ -23,9 +23,15 @@ In Keep mode the vault DB only grows: about 800 MB for 5.5 GB of transcripts on 
 audited machine (parsed text, FTS index, metadata). Settings shows the size; "Delete all
 archived" removes archived sessions (favorites keep their snapshots).
 
-Backups are full snapshots, so the default of three takes about 3× the DB size on top
-(≈2.4 GB on the audited machine). Settings shows the total and lets you keep 1 or turn
+Backups are full snapshots, so the default of three dailies takes about 3× the DB size on
+top (≈2.4 GB on the audited machine). Safety copies add to that: the latest 2 manual,
+before-upgrade, before-purge and before-restore backups each, so up to 8× more once all of
+those have happened twice. Settings shows the total and lets you keep 1 daily or turn
 automatic backups off (ADR-0010).
+
+A session file that is rewritten or shrinks keeps its old rows as an archived session, so a
+tool that rewrites a transcript again and again adds a full copy each time, and lines that
+survive the rewrite show up twice in search until the archive is purged.
 
 ## Codex CLI support is best effort
 
