@@ -379,6 +379,18 @@ describe('a file that comes back different never replaces what the vault holds',
     expect(rows).toEqual([archived])
   })
 
+  it('a deletion event does not touch a row already archived, in either mode', async () => {
+    const { db, file, sessions } = await indexed(ORIGINAL)
+    fs.rmSync(file)
+    handleSessionUnlink(db, file, 'keep')
+    const [archived] = sessions()
+
+    // A file that appeared and vanished before it was indexed, after a switch to mirror.
+    expect(handleSessionUnlink(db, file, 'mirror')).toBe(false)
+    expect(handleSessionUnlink(db, file, 'keep')).toBe(false)
+    expect(sessions()).toEqual([archived])
+  })
+
   it('favorites and tags follow msg_key across generations', async () => {
     const { db, file, index, sessions } = await indexed(ORIGINAL)
     addFavorite(db, idsOf(db, file)[0])

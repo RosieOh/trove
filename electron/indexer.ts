@@ -309,9 +309,14 @@ export function reconcileMissing(db: DbHandle, adapter: ToolAdapter, mode: Archi
   return changed
 }
 
-/** A transcript file was deleted: archive or drop its session per the archive setting. */
+/**
+ * A transcript file was deleted: archive or drop its session per the archive setting. A
+ * row already archived stays as it is, in mirror mode too: only a purge removes those.
+ */
 export function handleSessionUnlink(db: DbHandle, filePath: string, mode: ArchiveMode): boolean {
-  const row = db.prepare(`SELECT id FROM sessions WHERE file_path = ?`).get(filePath) as { id: number } | undefined
+  const row = db.prepare(`SELECT id FROM sessions WHERE file_path = ? AND archived_at IS NULL`).get(filePath) as
+    | { id: number }
+    | undefined
   if (!row) return false
   if (mode === 'keep') db.prepare(`UPDATE sessions SET archived_at = ? WHERE id = ?`).run(Date.now(), row.id)
   else db.prepare(`DELETE FROM sessions WHERE id = ?`).run(row.id)
