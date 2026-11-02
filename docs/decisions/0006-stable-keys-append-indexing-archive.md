@@ -48,6 +48,9 @@ files follow the same rule, and so do single file-deletion events from the watch
 scan re-parse live files, reset `sessions.indexed_bytes` (`requestFullReparse`). The
 one-time v≤8 → v9 migration first moves favorites/tags to stable keys (re-reading the
 referenced lines to find their uuids), then rebuilds the derived tables.
+(Amended 2026-11-02: it no longer rebuilds them. The rows stay and the next scan re-parses
+them, so a line whose file had gone before the upgrade is kept too. Migrations are now
+numbered files; see `docs/architecture.md`.)
 
 ## Consequences
 

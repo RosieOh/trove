@@ -12,7 +12,7 @@ This repository is the **Trove** Electron + React app. Use this file as a quick 
 
 ## Layout
 
-- `electron/` — main process, preload, IPC handlers; `indexWorker.ts` (only writer of index tables) and `queryWorker.ts` (search/stats/transcripts) run on worker threads.
+- `electron/` — main process, preload, IPC handlers; `indexWorker.ts` (only writer of index tables) and `queryWorker.ts` (search/stats/transcripts) run on worker threads; `migrations/` holds one file per schema change.
 - `src/` — React UI (Tailwind). `App.tsx` is the shell + search; tabs in `src/tabs/`, widgets in `src/components/`. Uses `window.vault` from preload; types in `src/vite-env.d.ts`.
 - `shared/` — JSONL parser + IPC DTOs imported by both main and renderer type-only paths.
 - `docs/` — PRD, architecture, ADRs, roadmap, release process.
@@ -31,10 +31,10 @@ This repository is the **Trove** Electron + React app. Use this file as a quick 
   may write outside those two roots when the user asks for it — see [ADR-0004](docs/decisions/0004-write-scope-under-claude-home.md).
   That includes `mkdir`: a missing root is polled, never created.
 - **User data never keys on row ids** — favorites and tags use `messages.msg_key` (line uuid). Message ids change whenever a file is re-read ([ADR-0006](docs/decisions/0006-stable-keys-append-indexing-archive.md)).
-- **Migrations never drop `sessions`/`messages`/`plan_files`** — archived sessions and plans exist only in the vault DB. Force a re-parse with `requestFullReparse` instead. Startup copies the DB to `userData/backups` before any migration, and opening goes through `openVaultDbWithRecovery` ([ADR-0010](docs/decisions/0010-vault-db-backups.md)) — don't open the main DB any other way. Only `SQLITE_CORRUPT`/`SQLITE_NOTADB` may swap the DB for a backup; every other failure is a retry.
+- **Migrations never drop `sessions`/`messages`/`plan_files`** — archived sessions and plans exist only in the vault DB. Force a re-parse with `reparse: true` on the migration instead. Startup copies the DB to `userData/backups` before any migration, and opening goes through `openVaultDbWithRecovery` ([ADR-0010](docs/decisions/0010-vault-db-backups.md)) — don't open the main DB any other way. Only `SQLITE_CORRUPT`/`SQLITE_NOTADB` may swap the DB for a backup; every other failure is a retry.
 - **Nothing slow on the main thread** — scans and heavy queries belong on the workers ([ADR-0007](docs/decisions/0007-worker-threads.md)).
 - **No telemetry** — do not add network calls without an explicit, reviewed ADR. The update check is the only one ([ADR-0005](docs/decisions/0005-update-check-network-exception.md)).
-- **SQLite migrations** — bump schema carefully in `electron/db.ts` and document in `docs/architecture.md`.
+- **SQLite migrations** — a schema change is a new file, `electron/migrations/NNNN-slug.ts`, with an id allocated in [docs/architecture.md](docs/architecture.md#migrations), where the rules are: additive only, a feature prefix on new tables, `session_id REFERENCES sessions ON DELETE CASCADE` on tables that belong to a session. `SCHEMA_SQL` is frozen at v10; never edit it, and never set `SCHEMA_VERSION` by hand, as it comes from the files. `electron/db.ts` loads them with `import.meta.glob`, so it only runs through Vite: `tsx` scripts must not import it at runtime.
 
 ## Where to start an Issue fix
 

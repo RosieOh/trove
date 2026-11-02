@@ -139,7 +139,7 @@ Run `npm run poc` to see how your own corpus classifies.
 | `string` | Top-level string content |
 | `invalid_json` | Raw preview only |
 
-## SQLite schema (v10, summary)
+## SQLite schema (summary)
 
 Index tables (derived, rebuildable except archived sessions):
 
@@ -172,13 +172,79 @@ User data (never derivable — never dropped by a migration):
 - `meta` — `schema_version`, `prices_seed_version`, settings as `setting.*`
   (`archiveMode`, `autoUpdate`, `backupKeep`).
 
-**Migrations.** From v9 on, a migration must never drop `sessions`/`messages`; to force a
-re-parse, call `requestFullReparse` (resets `indexed_bytes`). The v≤8 → v9 migration moved
-favorites/tags to stable keys by re-reading the referenced lines, then rebuilt the index
-tables. v9 → v10 adds `plan_files.archived_at` in place (no re-parse). Before any migration
-the old file is copied to the backup folder, and if that copy fails the migration does not
-run (unless backups are off). A DB with a version above `SCHEMA_VERSION` is never written.
-Document every bump here.
+Bookkeeping: `schema_migrations` (`id`, `applied_at`) has one row per migration applied.
+
+### Migrations
+
+`SCHEMA_SQL` in `electron/db.ts` is frozen at v10, the baseline. Every change since is a
+file, `electron/migrations/NNNN-slug.ts`, with these exports:
+
+```ts
+import type { DbHandle } from '../db.js'
+
+export const id = 12
+export function up(db: DbHandle) {
+  db.exec(`CREATE TABLE cap_example (session_id INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE)`)
+}
+export const reparse = true // optional: the next scan re-reads every live session
+```
+
+`import.meta.glob` finds the files, and `SCHEMA_VERSION` is the highest id among them, so
+adding a file is the whole change. The glob is a Vite transform: whatever imports
+`electron/db.ts` has to run through Vite, which the app and Vitest do and `tsx` does not.
+
+Each time main opens the DB (`migrate`):
+
+1. A DB holding an applied id this build does not know, or a `schema_version` above its
+   highest id, came from a newer build. It is refused without a write (`newer-build`).
+2. A DB with no `schema_migrations` has not finished the baseline. One transaction brings
+   it to v10, and it never runs again after that, so it cannot undo a later step.
+3. Every known id with no row in `schema_migrations` runs, lowest first. Each step, its row
+   and `meta.schema_version` (the highest id applied) commit in one transaction. A step that
+   fails rolls back alone: the ones before it stay applied, startup reports `retryable`, and
+   the next launch carries on from that step.
+
+Each id is checked on its own rather than against one number, so the order branches merge
+in makes no difference. A lower id merged after a higher one has shipped still runs, and
+leaves `schema_version` where it was. With anything pending, the file is copied to the backup
+folder first; if that copy fails no step runs (unless backups are off).
+
+Ids are allocated here, and nothing else takes one. Two files claiming one id, or a file
+name that does not match its id, throw as `electron/db.ts` loads, so the merge fails
+`npm run test:db`.
+
+| Id | File | Tables |
+|----|------|--------|
+| 11 | `0011-schema-migrations.ts` | `schema_migrations` |
+| 12 | capture | `cap_` |
+| 13 | parser health | `health_` |
+| 14 | go to why | `why_` |
+| 15 | secret guard | `secret_` |
+| 16 | trust controls | `policy_` |
+
+Rules for a step, of which `tests/db/migration.test.ts` checks the first three on the real
+files:
+
+- Additive only. Never drop `sessions`, `messages` or `plan_files`: archived sessions and
+  plans exist only in this DB. Never drop user data.
+- A new table takes its feature's prefix from the table above.
+- A table whose rows belong to a session has `session_id REFERENCES sessions ON DELETE
+  CASCADE`, so purging or deleting a session takes them along.
+- To re-parse, set `reparse`. It calls `requestFullReparse` in the step's transaction, which
+  resets `indexed_bytes` on live sessions; archived ones have no file to read and stay as
+  they are.
+- `up` runs inside the transaction: no `BEGIN`, no `COMMIT`, nothing async, and no `PRAGMA
+  foreign_keys` (a no-op there). Import from `../db.js` for types only, as the files load
+  while `db.ts` does.
+
+Before the runner:
+
+- v≤8 → v9 moves favorites and tags to stable keys by re-reading the referenced lines. The
+  rows stay: columns are added in place, each line's `msg_key` starts as `file#line`, and FTS
+  is rebuilt. The next scan re-parses every file still there (`indexed_bytes` is 0) and
+  archives the sessions whose file has gone. Tables of those names without the columns every
+  build wrote are renamed `legacy_*`, since there is nothing in them to carry over.
+- v9 → v10 adds `plan_files.archived_at` in place (no re-parse).
 
 ## Backups
 
@@ -189,7 +255,7 @@ is the only copy of deleted transcripts, so it is snapshotted:
 |------|-----|---------------|
 | Daily (after the first scan, then checked hourly) | `VACUUM INTO` `.tmp` → rename | index worker |
 | "Back up now" | same | index worker |
-| Before a schema migration | file copy (clone on APFS) before any connection opens | main, at startup |
+| With any migration pending | file copy (clone on APFS) before any connection opens | main, at startup |
 | Before "Delete all archived" (purge refused if it fails) | `VACUUM INTO` | index worker |
 | Before a restore | rename of the live file | main, all connections closed |
 
@@ -202,18 +268,19 @@ deleting any. Snapshots are skipped below 1.2× the DB size of free space.
 | Outcome | When | What happens |
 |---------|------|--------------|
 | `ok` | The DB opened | |
-| `recovered` | `SQLITE_CORRUPT` / `SQLITE_NOTADB`, or no DB while a backup or a quarantined file exists | Quarantined (`vault.db.corrupt-<time>`) if there was a file, newest backup that passes `verifyBackup` installed (`quick_check`, a vault schema no newer than `SCHEMA_VERSION`), dialog |
+| `recovered` | `SQLITE_CORRUPT` / `SQLITE_NOTADB`, or no DB while a backup or a quarantined file exists | Quarantined (`vault.db.corrupt-<time>`) if there was a file, newest backup that passes `verifyBackup` installed (`quick_check`, a vault schema this build knows all of), dialog |
 | `rebuilt` | The same, and no backup passes | Quarantined if there was a file, empty DB created, dialog |
-| `retryable` + code + path | Anything else: busy, disk full, permissions | No DB handle, no file swapped; dialog with the path that failed (the backup folder when the pre-migration copy failed), the code, Try again and Quit |
-| `newer-build` | Schema above `SCHEMA_VERSION` | No DB handle, no write; dialog with the versions, the path and Quit |
+| `retryable` + code + path | Anything else: busy, disk full, permissions, a migration step that failed | No DB handle, no file swapped; dialog with the path that failed (the backup folder when the pre-migration copy failed), the code, Try again and Quit |
+| `newer-build` | Schema above `SCHEMA_VERSION`, or an applied migration id this build does not know | No DB handle, no write; dialog with the versions, the path and Quit |
 
 No DB and nothing to say there ever was one is a first launch, which is `ok`.
 
-Before opening, a read-only connection reads the schema version and the backup setting. If
-that read fails the DB is not opened: corruption goes to recovery, anything else (a lock
-that outlasts its timeout, say) is `retryable`, because without the version nothing could
-tell whether the open would migrate. A file with tables and no version counts as a migration
-too, since the legacy path rebuilds it. A file with no tables needs no copy.
+Before opening, a read-only connection reads the schema version, the applied migrations and
+the backup setting. If that read fails the DB is not opened: corruption goes to recovery,
+anything else (a lock that outlasts its timeout, say) is `retryable`, because without them
+nothing could tell whether the open would migrate. A file with tables and no version has
+every migration pending, like any DB from before the runner. A file with no tables needs no
+copy.
 
 A DB file or sidecar that cannot be written is `retryable` before SQLite touches it. SQLite
 would open it read-only without saying so, and leave sidecars with the file's mode that fail
@@ -313,16 +380,19 @@ helpers in `src/format.ts`. The visual system — tokens and glass component cla
 - `npm test` — unit tests (parser, Codex parser, search helpers, pricing, IPC guards).
 - `npm run test:db` — SQLite integration tests in `tests/db/` (append indexing, partial
   lines, re-read with favorites, archive vs mirror, missing-root guard, usage dedupe, FTS
-  integrity, prompts, v8 migration, backups). `better-sqlite3` ships N-API prebuilds, so
-  they run under plain Node with the same binary the app loads in Electron.
+  integrity, prompts, upgrades from v8, v9 and v10, merge order and per-step rollback of
+  migrations, backups). `better-sqlite3` ships N-API prebuilds, so they run under plain
+  Node with the same binary the app loads in Electron.
 - `npm run test:e2e` — `tests/e2e/smoke.mjs` launches the built app with Playwright
   against a temporary copy of `tests/e2e/fixtures` (Claude sessions, a plan, a Codex
   rollout; `CLAUDE_HOME` / `CODEX_HOME` / `VAULT_USER_DATA` point into it). It covers
   startup, indexing, UI search, prompts, stats, plans, Codex, live append, archiving on
-  delete, indexing with the window closed and the daily backup. It also checks that the
+  delete, indexing with the window closed, the daily backup, every migration file running in
+  the built app and a v10 DB upgrading with its archive intact. It also checks that the
   renderer logs no errors, that the app quits cleanly and that nothing was written under
-  the transcript roots. Startups that end in a dialog (a newer-build DB, a read-only data
-  folder, DB file or backup folder) run without Playwright, with
+  the transcript roots. Startups that end in a dialog (a newer-build DB, one holding an
+  unknown migration id, a read-only data folder, DB file or backup folder) run without
+  Playwright, with
   `tests/e2e/record-dialogs.cjs` answering with the last button. A DB that went missing runs
   with both, since the app stays open after telling the user.
   CI runs it on macOS, Windows and Linux (`xvfb-run`, `--no-sandbox`).

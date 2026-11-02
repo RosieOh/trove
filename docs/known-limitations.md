@@ -7,7 +7,7 @@ found a dozen new top-level types). The parser treats any typed line other than
 `user` / `assistant` / `system` as bookkeeping, so new types degrade to hidden meta rows
 rather than polluting search — but genuinely new *conversation* shapes may still parse as
 empty or generic bodies. **Mitigation:** run `npm run poc`, extend `shared/jsonlParse.ts`,
-and use Settings → "re-read all files" (or `requestFullReparse` in a migration). Updates
+and use Settings → "re-read all files" (or `reparse: true` on a migration). Updates
 matter for this reason (ADR-0005).
 
 ## Prompt detection is heuristic
