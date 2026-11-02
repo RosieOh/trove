@@ -1,6 +1,8 @@
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import { fileURLToPath } from 'node:url'
+import Database from 'better-sqlite3'
 import { afterEach } from 'vitest'
 import { openVaultDb, type DbHandle } from '../../electron/db'
 import { upsertProject } from '../../electron/indexer'
@@ -49,6 +51,22 @@ export function sandbox() {
   const project = (db: DbHandle) =>
     upsertProject(db, { slug: '-work-app', root: projectRoot, displayName: '/work/app' }, 'claude')
   return { dir, projectsRoot, projectRoot, dbFile, open, adapter, project }
+}
+
+/** A DB as that version shipped, from its schema in `tests/db/fixtures`. The caller closes it. */
+export function createShippedDb(dbFile: string, version: 9 | 10): DbHandle {
+  const db = new Database(dbFile)
+  db.exec(fs.readFileSync(fileURLToPath(new URL(`./fixtures/schema-v${version}.sql`, import.meta.url)), 'utf8'))
+  db.prepare(`INSERT INTO meta VALUES ('schema_version', ?)`).run(String(version))
+  return db
+}
+
+/**
+ * Leaves a current DB with a step still to run. 0011 is the one step safe to run twice, so
+ * this stays true as migrations are added: a later step would fail on tables it already made.
+ */
+export function markStepPending(db: DbHandle) {
+  db.prepare(`DELETE FROM schema_migrations WHERE id = 11`).run()
 }
 
 export const userLine = (uuid: string, text: string, ts = '2026-10-01T10:00:00.000Z') =>

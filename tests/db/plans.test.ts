@@ -7,7 +7,7 @@ import { readSchemaVersion, SCHEMA_VERSION, type DbHandle } from '../../electron
 import { fullReindexPlans, indexPlanSinglePath } from '../../electron/plansIndexer'
 import { purgeArchived } from '../../electron/queries'
 import { unifiedSearch } from '../../electron/search'
-import { sandbox } from './helpers'
+import { createShippedDb, sandbox } from './helpers'
 
 function withPlans() {
   const sb = sandbox()
@@ -168,10 +168,9 @@ describe('a plan file that comes back never replaces an archived body', () => {
 
 describe('schema v9 → v10', () => {
   it('adds plan_files.archived_at in place, after a pre-migration copy', () => {
-    const { db, dbFile, dir, plansRoot } = withPlans()
-    fullReindexPlans(db, plansRoot, 'keep')
-    db.exec(`ALTER TABLE plan_files DROP COLUMN archived_at`)
-    db.prepare(`UPDATE meta SET value = '9' WHERE key = 'schema_version'`).run()
+    const { dbFile, dir } = sandbox()
+    const db = createShippedDb(dbFile, 9)
+    db.prepare(`INSERT INTO plan_files (file_path, file_mtime_ms, title, body) VALUES ('/plans/rollout.md', 1, 'Rollout', 'body')`).run()
     db.close()
 
     const backups = path.join(dir, 'backups')

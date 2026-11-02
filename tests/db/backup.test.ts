@@ -15,10 +15,10 @@ import {
   snapshot,
   verifyBackup,
 } from '../../electron/backup'
-import { openVaultDb, readSchemaVersion, SCHEMA_VERSION, setSetting, type DbHandle } from '../../electron/db'
+import { openVaultDb, pendingMigrations, readSchemaVersion, SCHEMA_VERSION, setSetting, type DbHandle } from '../../electron/db'
 import { indexSessionFile } from '../../electron/indexer'
 import { addFavorite, listFavorites, removeFavorite } from '../../electron/queries'
-import { assistantLine, sandbox, userLine, writeLines } from './helpers'
+import { assistantLine, markStepPending, sandbox, userLine, writeLines } from './helpers'
 
 async function seeded() {
   const sb = sandbox()
@@ -37,6 +37,14 @@ const count = (db: DbHandle, table: string) => (db.prepare(`SELECT COUNT(*) AS c
 
 function readOnly(file: string) {
   return new Database(file, { readonly: true, fileMustExist: true })
+}
+
+/** True when the file still has the step `markStepPending` took away: nothing migrated it. */
+function stepStillPending(file: string) {
+  const db = readOnly(file)
+  const pending = pendingMigrations(db).length > 0
+  db.close()
+  return pending
 }
 
 const coded = (code: string) => Object.assign(new Error(`${code}: simulated`), { code })
@@ -379,7 +387,7 @@ describe('startup recovery', () => {
     copy.close()
 
     // Same upgrade with backups turned off: no copy.
-    db!.prepare(`UPDATE meta SET value = '8' WHERE key = 'schema_version'`).run()
+    markStepPending(db!)
     setSetting(db!, 'backupKeep', '0')
     db!.close()
     fs.rmSync(backups, { recursive: true })
@@ -421,8 +429,8 @@ describe('an open that fails for any other reason swaps nothing', () => {
   it('leaves a healthy DB alone while another connection holds the write lock', async () => {
     const { db, dbFile, backups } = await seeded()
     snapshot(db, backups, 'daily', new Date(Date.UTC(2026, 9, 1)))
-    // One schema behind, so opening has to write: a current DB would open without the lock.
-    db.prepare(`UPDATE meta SET value = ? WHERE key = 'schema_version'`).run(String(SCHEMA_VERSION - 1))
+    // A step pending, so opening has to write: a current DB would open without the lock.
+    markStepPending(db)
     // No pre-migration copy: this is about the open, and Windows may refuse to copy a file
     // this connection holds open.
     setSetting(db, 'backupKeep', '0')
@@ -579,7 +587,7 @@ describe('an open that fails for any other reason swaps nothing', () => {
 
   it('does not migrate when the pre-migration copy cannot be made', async () => {
     const { db, dbFile, backups } = await seeded()
-    db.prepare(`UPDATE meta SET value = ? WHERE key = 'schema_version'`).run(String(SCHEMA_VERSION - 1))
+    markStepPending(db)
     db.close()
     const copy = vi.spyOn(fs, 'copyFileSync').mockImplementation((_from, to) => {
       fs.writeFileSync(to, 'partial')
@@ -592,16 +600,14 @@ describe('an open that fails for any other reason swaps nothing', () => {
     expect(opened.outcome).toEqual({ kind: 'retryable', code: 'ENOSPC', path: backups })
     // A partial copy must not eat the space the retry needs.
     expect(fs.readdirSync(backups)).toEqual([])
-    const check = readOnly(dbFile)
-    expect(readSchemaVersion(check)).toBe(SCHEMA_VERSION - 1)
-    check.close()
+    expect(stepStillPending(dbFile)).toBe(true)
   })
 
   it.skipIf(process.platform === 'win32' || process.getuid?.() === 0)(
     'names the backup folder when that is what cannot be written',
     async () => {
       const { db, dbFile, backups } = await seeded()
-      db.prepare(`UPDATE meta SET value = ? WHERE key = 'schema_version'`).run(String(SCHEMA_VERSION - 1))
+      markStepPending(db)
       db.close()
       fs.mkdirSync(backups)
       fs.chmodSync(backups, 0o555)
@@ -618,14 +624,8 @@ describe('an open that fails for any other reason swaps nothing', () => {
 describe('a migration never runs without its copy', () => {
   async function oneBehind() {
     const { db, dbFile, backups } = await seeded()
-    db.prepare(`UPDATE meta SET value = ? WHERE key = 'schema_version'`).run(String(SCHEMA_VERSION - 1))
+    markStepPending(db)
     return { db, dbFile, backups }
-  }
-  const versionOf = (dbFile: string) => {
-    const check = readOnly(dbFile)
-    const version = readSchemaVersion(check)
-    check.close()
-    return version
   }
 
   it(
@@ -640,7 +640,7 @@ describe('a migration never runs without its copy', () => {
       expect(opened.outcome).toEqual({ kind: 'retryable', code: 'SQLITE_BUSY', path: dbFile })
       expect(listBackups(backups)).toEqual([])
       db.close()
-      expect(versionOf(dbFile)).toBe(SCHEMA_VERSION - 1)
+      expect(stepStillPending(dbFile)).toBe(true)
     },
     20_000,
   )
@@ -661,7 +661,7 @@ describe('a migration never runs without its copy', () => {
     opened.db!.close()
   })
 
-  it('covers a DB with tables and no version, which the legacy migration rebuilds', () => {
+  it('covers a DB with tables and no version, whose tables the legacy migration moves aside', () => {
     const sb = sandbox()
     const backups = path.join(sb.dir, 'backups')
     const legacy = new Database(sb.dbFile)
@@ -674,6 +674,7 @@ describe('a migration never runs without its copy', () => {
     const opened = openVaultDbWithRecovery(sb.dbFile, backups)
     expect(opened.outcome).toEqual({ kind: 'ok' })
     expect(count(opened.db!, 'messages')).toBe(0)
+    expect(count(opened.db!, 'legacy_messages')).toBe(1)
     opened.db!.close()
     const [pre] = listBackups(backups)
     expect(pre.reason).toBe('pre-migration')
