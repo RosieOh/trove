@@ -38,23 +38,33 @@ export function derivePlanTitle(body: string, basename: string): string {
   return basename.replace(/\.md$/i, '')
 }
 
+/**
+ * Index one plan. A live plan is a document people edit, so a new version replaces the row.
+ * An archived row is a copy nothing else holds: a file back at its path makes it live again
+ * only if the content is the same. Any other file keeps it, renamed to a path no file can
+ * have, as sessions do (see `setAsideSession` in indexer.ts).
+ */
 export function indexPlanFileSync(db: DbHandle, filePath: string): void {
   const stat = fs.statSync(filePath)
   const mtime = Math.trunc(stat.mtimeMs)
   const existing = db
-    .prepare(`SELECT id, file_mtime_ms FROM plan_files WHERE file_path = ?`)
-    .get(filePath) as { id: number; file_mtime_ms: number } | undefined
+    .prepare(`SELECT id, file_mtime_ms, archived_at FROM plan_files WHERE file_path = ?`)
+    .get(filePath) as { id: number; file_mtime_ms: number; archived_at: number | null } | undefined
 
-  if (existing && existing.file_mtime_ms === mtime) {
-    // An archived plan whose file came back unchanged is live again.
-    db.prepare(`UPDATE plan_files SET archived_at = NULL WHERE id = ? AND archived_at IS NOT NULL`).run(existing.id)
-    return
-  }
+  if (existing && existing.archived_at == null && existing.file_mtime_ms === mtime) return
 
   const body = fs.readFileSync(filePath, 'utf8')
   const title = derivePlanTitle(body, path.basename(filePath))
 
   const tx = db.transaction(() => {
+    if (existing && existing.archived_at != null) {
+      const archived = db.prepare(`SELECT body FROM plan_files WHERE id = ?`).get(existing.id) as { body: string }
+      if (archived.body === body) {
+        db.prepare(`UPDATE plan_files SET archived_at = NULL, file_mtime_ms = ? WHERE id = ?`).run(mtime, existing.id)
+        return
+      }
+      setAsidePlan(db, existing.id, filePath)
+    }
     db.prepare(`DELETE FROM plan_files WHERE file_path = ?`).run(filePath)
     db.prepare(`INSERT INTO plan_files (file_path, file_mtime_ms, title, body) VALUES (?, ?, ?, ?)`).run(
       filePath,
@@ -66,15 +76,25 @@ export function indexPlanFileSync(db: DbHandle, filePath: string): void {
   tx()
 }
 
-/** A plan whose file is gone: archived in Keep mode, deleted in Mirror mode (like sessions). */
+function setAsidePlan(db: DbHandle, id: number, filePath: string) {
+  const taken = db.prepare(`SELECT 1 FROM plan_files WHERE file_path = ?`)
+  let ts = Date.now()
+  while (taken.get(`${filePath}#archived-${ts}`)) ts += 1
+  db.prepare(`UPDATE plan_files SET file_path = ? WHERE id = ?`).run(`${filePath}#archived-${ts}`, id)
+}
+
+/**
+ * A live plan whose file is gone: archived in Keep mode, deleted in Mirror mode (like
+ * sessions). A plan already archived stays as it is in both: only a purge removes those.
+ */
 function planFileGone(db: DbHandle, id: number, mode: ArchiveMode) {
-  if (mode === 'keep') db.prepare(`UPDATE plan_files SET archived_at = ? WHERE id = ? AND archived_at IS NULL`).run(Date.now(), id)
+  if (mode === 'keep') db.prepare(`UPDATE plan_files SET archived_at = ? WHERE id = ?`).run(Date.now(), id)
   else db.prepare(`DELETE FROM plan_files WHERE id = ?`).run(id)
 }
 
 function pruneMissingPlanRows(db: DbHandle, plansRoot: string, mode: ArchiveMode): void {
   const normRoot = path.normalize(plansRoot)
-  const rows = db.prepare(`SELECT id, file_path FROM plan_files`).all() as { id: number; file_path: string }[]
+  const rows = db.prepare(`SELECT id, file_path FROM plan_files WHERE archived_at IS NULL`).all() as { id: number; file_path: string }[]
   for (const r of rows) {
     const fp = path.normalize(r.file_path)
     const rel = path.relative(normRoot, fp)
@@ -104,7 +124,9 @@ export function indexPlanSinglePath(db: DbHandle, plansRoot: string, absoluteFil
 
   if (!fs.existsSync(normalized)) {
     if (!fs.existsSync(normRoot)) return
-    const row = db.prepare(`SELECT id FROM plan_files WHERE file_path = ?`).get(normalized) as { id: number } | undefined
+    const row = db.prepare(`SELECT id FROM plan_files WHERE file_path = ? AND archived_at IS NULL`).get(normalized) as
+      | { id: number }
+      | undefined
     if (row) planFileGone(db, row.id, mode)
     return
   }
