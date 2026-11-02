@@ -246,6 +246,37 @@ describe('migration from the v8 schema', () => {
     fresh.close()
   })
 
+  it('carries the oldest shape over too: v3, before any of the later columns', () => {
+    const sb = sandbox()
+    const old = new Database(sb.dbFile)
+    old.exec(`
+      CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+      INSERT INTO meta VALUES ('schema_version', '3');
+      CREATE TABLE projects (id INTEGER PRIMARY KEY AUTOINCREMENT, slug TEXT NOT NULL UNIQUE, root_path TEXT NOT NULL,
+        display_name TEXT NOT NULL, last_indexed_at INTEGER, last_modified INTEGER);
+      CREATE TABLE sessions (id INTEGER PRIMARY KEY AUTOINCREMENT, project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        rel_path TEXT NOT NULL, file_path TEXT NOT NULL UNIQUE, file_mtime_ms INTEGER NOT NULL, message_count INTEGER NOT NULL DEFAULT 0,
+        UNIQUE(project_id, rel_path));
+      CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+        line_index INTEGER NOT NULL, role TEXT NOT NULL, body TEXT NOT NULL, content_kinds TEXT, raw_preview TEXT,
+        UNIQUE(session_id, line_index));
+      INSERT INTO projects (slug, root_path, display_name) VALUES ('-work-app', '/work/app', '/work/app');
+      INSERT INTO sessions (project_id, rel_path, file_path, file_mtime_ms) VALUES (1, 's.jsonl', '/work/app/s.jsonl', 1);
+      INSERT INTO messages (session_id, line_index, role, body) VALUES (1, 0, 'user', 'oldestquokka');
+    `)
+    old.close()
+
+    const db = sb.open()
+    expect(db.prepare(`SELECT id, body, message_class, msg_key FROM messages`).all()).toEqual([
+      { id: 1, body: 'oldestquokka', message_class: 'dialog', msg_key: '/work/app/s.jsonl#0' },
+    ])
+    expect(hits(db, 'oldestquokka')).toEqual([1])
+    const fresh = openVaultDb(path.join(sb.dir, 'fresh.db'))
+    expect(shapeOf(db)).toEqual(shapeOf(fresh))
+    fresh.close()
+    expectHealthy(db)
+  })
+
   it('keeps user price edits and adds newly published models', () => {
     const sb = sandbox()
     const file = path.join(sb.projectRoot, 's.jsonl')
@@ -575,6 +606,8 @@ describe('a DB holding an id this build does not know', () => {
   it('returns newer-build at startup, with the file and its folder untouched', () => {
     const { db, dbFile, dir, backups, unknown } = withUnknownId()
     db.prepare(`INSERT INTO schema_migrations (id, applied_at) VALUES (?, 1)`).run(unknown)
+    // Something is pending as well, so a check made only at the open would copy the file first.
+    markStepPending(db)
     db.close()
     const bytes = fs.readFileSync(dbFile)
     const before = fs.readdirSync(dir).sort()

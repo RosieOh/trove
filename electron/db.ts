@@ -530,7 +530,7 @@ function migrateLegacyToV9(db: DbHandle) {
          WHERE type IN ('trigger', 'index') AND sql IS NOT NULL AND tbl_name IN ('projects', 'sessions', 'messages')`,
       )
       .all() as { type: string; name: string }[]
-    for (const { type, name } of attached) db.exec(`DROP ${type} ${name}`)
+    for (const { type, name } of attached) db.exec(`DROP ${type} "${name}"`)
     db.exec(`DROP TABLE IF EXISTS messages_fts`)
     db.exec(`DROP VIEW IF EXISTS messages_searchable`)
     if (hasLegacyFavs) db.exec(`DROP TABLE favorites`)
