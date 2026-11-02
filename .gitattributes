@@ -1,0 +1,5 @@
+# Line-based barrels: one self-contained entry per line, in no meaningful order. Two branches
+# adding entries both keep theirs, without a conflict. Union merging keeps every line and
+# never reports a clash, so it is only for files of that shape: never multi-line entries,
+# and never a file whose lines depend on each other.
+**/features/index.ts merge=union
