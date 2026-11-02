@@ -1,7 +1,7 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import Database from 'better-sqlite3'
-import { getSetting, openVaultDb, readSchemaVersion, SCHEMA_VERSION, type DbHandle } from './db.js'
+import { getSetting, NewerSchemaError, openVaultDb, readSchemaVersion, SCHEMA_VERSION, type DbHandle } from './db.js'
 import { BACKUP_KEEP_CHOICES, DEFAULT_BACKUP_KEEP, type BackupFile, type BackupReason } from '../shared/ipc.js'
 
 /**
@@ -15,7 +15,11 @@ import { BACKUP_KEEP_CHOICES, DEFAULT_BACKUP_KEEP, type BackupFile, type BackupR
 /** A daily snapshot is due when the newest backup is older than this. */
 export const DAILY_MS = 24 * 60 * 60 * 1000
 
-const REASONS: BackupReason[] = ['daily', 'manual', 'pre-migration', 'pre-purge', 'pre-restore']
+/** Taken because of one step, so dailies must never push them out; each has its own rotation. */
+const SAFETY_REASONS: BackupReason[] = ['manual', 'pre-migration', 'pre-purge', 'pre-restore']
+const SAFETY_KEEP = 2
+
+const REASONS: BackupReason[] = ['daily', ...SAFETY_REASONS]
 const NAME_RE = /^vault-(\d{8})-(\d{6})-([a-z-]+)\.db$/
 /** Files SQLite keeps next to a DB. Only the WAL carries data; `-shm` is rebuilt on open. */
 const SIDECARS = ['-wal', '-shm']
@@ -130,9 +134,15 @@ export function copyClosedDb(dbFile: string, dir: string, reason: BackupReason, 
   fs.mkdirSync(dir, { recursive: true })
   const name = freshName(dir, now, reason)
   const dest = path.join(dir, name)
-  if (fs.existsSync(`${dbFile}-wal`)) fs.copyFileSync(`${dbFile}-wal`, `${dest}-wal`, fs.constants.COPYFILE_FICLONE)
-  fs.copyFileSync(dbFile, `${dest}.tmp`, fs.constants.COPYFILE_FICLONE)
-  fs.renameSync(`${dest}.tmp`, dest)
+  try {
+    if (fs.existsSync(`${dbFile}-wal`)) fs.copyFileSync(`${dbFile}-wal`, `${dest}-wal`, fs.constants.COPYFILE_FICLONE)
+    fs.copyFileSync(dbFile, `${dest}.tmp`, fs.constants.COPYFILE_FICLONE)
+    fs.renameSync(`${dest}.tmp`, dest)
+  } catch (err) {
+    // On a full disk the retry needs the space a partial copy would hold on to.
+    for (const partial of [`${dest}.tmp`, `${dest}-wal`]) fs.rmSync(partial, { force: true })
+    throw err
+  }
   return { name, createdAt: parseName(name)!.createdAt, reason, sizeBytes: fs.statSync(dest).size }
 }
 
@@ -148,15 +158,20 @@ function removeBackup(dir: string, name: string) {
   for (const suffix of ['', ...SIDECARS]) fs.rmSync(path.join(dir, name + suffix), { force: true })
 }
 
-/** Keeps the newest `keep` backups; returns the names removed. `keep` 0 removes nothing. */
+/**
+ * Keeps the newest `keep` dailies and the latest `SAFETY_KEEP` of each other reason;
+ * returns the names removed. `keep` 0 removes nothing.
+ */
 export function pruneBackups(dir: string, keep: number): string[] {
   if (keep <= 0) return []
-  const removed: string[] = []
-  for (const b of listBackups(dir).slice(keep)) {
-    removeBackup(dir, b.name)
-    removed.push(b.name)
-  }
-  return removed
+  const all = listBackups(dir)
+  const ofReason = (reason: BackupReason) => all.filter((b) => b.reason === reason)
+  const surplus = [
+    ...ofReason('daily').slice(keep),
+    ...SAFETY_REASONS.flatMap((reason) => ofReason(reason).slice(SAFETY_KEEP)),
+  ]
+  for (const b of surplus) removeBackup(dir, b.name)
+  return surplus.map((b) => b.name)
 }
 
 export function dailyBackupDue(dir: string, keep: number, now = Date.now()): boolean {
@@ -165,26 +180,37 @@ export function dailyBackupDue(dir: string, keep: number, now = Date.now()): boo
   return !newest || now - newest.createdAt >= DAILY_MS
 }
 
-/** Opens a backup read-only and checks it is a vault DB this build can open. */
-export function verifyBackup(file: string): void {
-  if (!fs.existsSync(file)) throw new BackupError('missing', `backup not found: ${path.basename(file)}`)
-  // Opening a WAL-mode file, even read-only, creates empty -wal/-shm next to it; remove
-  // the ones this check created so the backup folder only holds backups.
+/**
+ * Runs `read` on a read-only connection and leaves the folder as it found it: opening a
+ * WAL-mode file, even read-only, creates empty -wal/-shm next to it, so the ones this
+ * open created are removed. Only for a file no other connection has open.
+ */
+function readClosedDb<T>(file: string, read: (db: DbHandle) => T): T {
   const created = SIDECARS.filter((s) => !fs.existsSync(file + s))
   let db: DbHandle | null = null
   try {
     db = new Database(file, { readonly: true, fileMustExist: true })
-    const check = db.pragma('quick_check', { simple: true })
-    if (check !== 'ok') throw new BackupError('invalid', `integrity check failed: ${String(check)}`)
-    const v = readSchemaVersion(db)
-    if (v === 0) throw new BackupError('invalid', 'not a vault database')
-    if (v > SCHEMA_VERSION) throw new BackupError('newer-schema', `backup is schema v${v}; this build reads up to v${SCHEMA_VERSION}`)
-  } catch (err) {
-    if (err instanceof BackupError) throw err
-    throw new BackupError('invalid', err instanceof Error ? err.message : String(err))
+    return read(db)
   } finally {
     db?.close()
     for (const s of created) fs.rmSync(file + s, { force: true })
+  }
+}
+
+/** Opens a backup read-only and checks it is a vault DB this build can open. */
+export function verifyBackup(file: string): void {
+  if (!fs.existsSync(file)) throw new BackupError('missing', `backup not found: ${path.basename(file)}`)
+  try {
+    readClosedDb(file, (db) => {
+      const check = db.pragma('quick_check', { simple: true })
+      if (check !== 'ok') throw new BackupError('invalid', `integrity check failed: ${String(check)}`)
+      const v = readSchemaVersion(db)
+      if (v === 0) throw new BackupError('invalid', 'not a vault database')
+      if (v > SCHEMA_VERSION) throw new BackupError('newer-schema', `backup is schema v${v}; this build reads up to v${SCHEMA_VERSION}`)
+    })
+  } catch (err) {
+    if (err instanceof BackupError) throw err
+    throw new BackupError('invalid', err instanceof Error ? err.message : String(err))
   }
 }
 
@@ -214,70 +240,164 @@ export type OpenOutcome =
   | { kind: 'recovered'; from: string; quarantined: string }
   | { kind: 'rebuilt'; quarantined: string }
 
-function quarantine(dbFile: string, now: Date): string {
+/** The DB was not opened, and the file on disk is the one that was there before. */
+export type OpenRefusal =
+  | { kind: 'retryable'; code: string }
+  | { kind: 'newer-build'; version: number; known: number }
+
+export type OpenResult = { db: DbHandle; outcome: OpenOutcome } | { db: null; outcome: OpenRefusal }
+
+export type RetryCause = 'busy' | 'full' | 'denied' | 'other'
+
+function errorCode(err: unknown): string {
+  const code = (err as { code?: unknown } | null)?.code
+  return typeof code === 'string' && code ? code : 'UNKNOWN'
+}
+
+/** The only errors that say the file itself is damaged. SQLite reports extended codes too. */
+function isCorruption(err: unknown): boolean {
+  const code = errorCode(err)
+  return code === 'SQLITE_NOTADB' || code === 'SQLITE_CORRUPT' || code.startsWith('SQLITE_CORRUPT_')
+}
+
+/** What the user can do about a retryable failure, from its SQLite or file system code. */
+export function retryCause(code: string): RetryCause {
+  if (/^(SQLITE_BUSY|SQLITE_LOCKED|EBUSY)/.test(code)) return 'busy'
+  if (/^(SQLITE_FULL|ENOSPC|EDQUOT)/.test(code)) return 'full'
+  if (/^(SQLITE_READONLY|SQLITE_CANTOPEN|SQLITE_PERM|EACCES|EPERM|EROFS)/.test(code)) return 'denied'
+  return 'other'
+}
+
+function retryable(err: unknown): { db: null; outcome: OpenRefusal } {
+  console.error('[vault] cannot open the database right now:', err)
+  return { db: null, outcome: { kind: 'retryable', code: errorCode(err) } }
+}
+
+function newerBuild(version: number): { db: null; outcome: OpenRefusal } {
+  return { db: null, outcome: { kind: 'newer-build', version, known: SCHEMA_VERSION } }
+}
+
+/**
+ * Moves a DB and its sidecars aside, all or nothing: a stale WAL left next to the DB that
+ * replaces this one would be replayed into it. A failed rename puts back what had moved.
+ */
+function quarantine(dbFile: string, now: Date): { target: string } | { error: unknown } {
   const stamp = now.toISOString().replace(/[:.]/g, '-')
   const target = `${dbFile}.corrupt-${stamp}`
-  for (const suffix of ['', ...SIDECARS]) {
-    const p = dbFile + suffix
+  const moved: string[] = []
+  try {
+    for (const suffix of ['', ...SIDECARS]) {
+      if (!fs.existsSync(dbFile + suffix)) continue
+      fs.renameSync(dbFile + suffix, target + suffix)
+      moved.push(suffix)
+    }
+    return { target }
+  } catch (error) {
+    unquarantine(dbFile, target, moved)
+    return { error }
+  }
+}
+
+function unquarantine(dbFile: string, target: string, suffixes: string[]) {
+  for (const suffix of suffixes) {
     try {
-      if (fs.existsSync(p)) fs.renameSync(p, target + suffix)
-    } catch {
-      fs.rmSync(p, { force: true })
+      fs.renameSync(target + suffix, dbFile + suffix)
+    } catch (err) {
+      console.error(`[vault] could not move ${target + suffix} back:`, err)
     }
   }
-  return target
+}
+
+/** Removes what `installCopy` or a failed open left at `dbFile`; the original is in quarantine. */
+function removeInstalled(dbFile: string) {
+  for (const suffix of ['', ...SIDECARS, '.restoring']) fs.rmSync(dbFile + suffix, { force: true })
+}
+
+/**
+ * Replaces a corrupt DB with the newest backup that opens, or an empty DB when none does.
+ * A failure that is not about the backup (a full disk, say) puts the corrupt file back, so
+ * the next attempt starts over instead of finding no DB and creating an empty one.
+ */
+function recover(dbFile: string, dir: string, now: Date, open: (file: string) => DbHandle): OpenResult {
+  const moved = quarantine(dbFile, now)
+  if ('error' in moved) return retryable(moved.error)
+  const quarantined = moved.target
+  const giveUp = (err: unknown) => {
+    removeInstalled(dbFile)
+    unquarantine(dbFile, quarantined, ['', ...SIDECARS].filter((s) => fs.existsSync(quarantined + s)))
+    return retryable(err)
+  }
+  for (const b of listBackups(dir)) {
+    const file = path.join(dir, b.name)
+    try {
+      verifyBackup(file)
+    } catch (err) {
+      console.error(`[vault] backup ${b.name} unusable:`, err)
+      continue
+    }
+    try {
+      installCopy(file, dbFile)
+      return { db: open(dbFile), outcome: { kind: 'recovered', from: b.name, quarantined } }
+    } catch (err) {
+      if (!isCorruption(err)) return giveUp(err)
+      console.error(`[vault] backup ${b.name} unusable:`, err)
+      removeInstalled(dbFile)
+    }
+  }
+  try {
+    return { db: open(dbFile), outcome: { kind: 'rebuilt', quarantined } }
+  } catch (err) {
+    return giveUp(err)
+  }
 }
 
 /** Schema version and backup setting of a DB without migrating it; null when unreadable. */
 function peek(dbFile: string): { version: number; keep: number } | null {
-  let db: DbHandle | null = null
   try {
-    db = new Database(dbFile, { readonly: true, fileMustExist: true })
-    return { version: readSchemaVersion(db), keep: backupKeepOf(db) }
+    return readClosedDb(dbFile, (db) => ({ version: readSchemaVersion(db), keep: backupKeepOf(db) }))
   } catch {
     return null
-  } finally {
-    db?.close()
   }
 }
 
 /**
  * Opens (and migrates) the vault DB at startup.
- * - Before a schema migration, the old file is copied to the backup folder.
- * - A DB that cannot be opened is quarantined (kept on disk) and the newest backup that
- *   opens takes its place; only when none does is an empty DB created for a fresh index.
+ * - A DB from a newer build is refused untouched.
+ * - Before a schema migration, the old file is copied to the backup folder. A migration
+ *   never runs without that copy (unless backups are off).
+ * - Only a DB that is actually damaged (`SQLITE_CORRUPT`, `SQLITE_NOTADB`) is quarantined
+ *   (kept on disk), and the newest backup that opens takes its place; only when none does
+ *   is an empty DB created for a fresh index. A locked file, a full disk or a read-only
+ *   folder says nothing about the DB, so those return `retryable` and swap nothing.
  */
 export function openVaultDbWithRecovery(
   dbFile: string,
   dir: string,
   now = new Date(),
-): { db: DbHandle; outcome: OpenOutcome } {
+  open: (file: string) => DbHandle = openVaultDb,
+): OpenResult {
   if (fs.existsSync(dbFile)) {
     const info = peek(dbFile)
+    if (info && info.version > SCHEMA_VERSION) return newerBuild(info.version)
     if (info && info.version > 0 && info.version < SCHEMA_VERSION && info.keep > 0) {
       try {
         copyClosedDb(dbFile, dir, 'pre-migration', now)
+      } catch (err) {
+        return retryable(err)
+      }
+      try {
         pruneBackups(dir, info.keep)
       } catch (err) {
-        console.error('[vault] pre-migration backup failed:', err)
+        console.error('[vault] could not prune old backups:', err)
       }
     }
   }
   try {
-    return { db: openVaultDb(dbFile), outcome: { kind: 'ok' } }
+    return { db: open(dbFile), outcome: { kind: 'ok' } }
   } catch (err) {
-    console.error('[vault] failed to open database:', err)
+    if (err instanceof NewerSchemaError) return newerBuild(err.version)
+    if (!isCorruption(err)) return retryable(err)
+    console.error('[vault] database is damaged:', err)
   }
-  const quarantined = quarantine(dbFile, now)
-  for (const b of listBackups(dir)) {
-    try {
-      verifyBackup(path.join(dir, b.name))
-      installCopy(path.join(dir, b.name), dbFile)
-      return { db: openVaultDb(dbFile), outcome: { kind: 'recovered', from: b.name, quarantined } }
-    } catch (err) {
-      console.error(`[vault] backup ${b.name} unusable:`, err)
-      for (const suffix of ['', ...SIDECARS]) fs.rmSync(dbFile + suffix, { force: true })
-    }
-  }
-  return { db: openVaultDb(dbFile), outcome: { kind: 'rebuilt', quarantined } }
+  return recover(dbFile, dir, now, open)
 }
