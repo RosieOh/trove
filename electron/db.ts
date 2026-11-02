@@ -5,20 +5,60 @@ import { readLines } from './lineReader.js'
 
 export type DbHandle = Database.Database
 
-export const SCHEMA_VERSION = 10
+/**
+ * One schema change: `electron/migrations/NNNN-slug.ts`, exporting these by name. Ids and
+ * the rules a step must follow are in docs/architecture.md.
+ */
+export type Migration = {
+  id: number
+  /** Runs inside the step's transaction, so it never BEGINs or COMMITs. */
+  up(db: DbHandle): void
+  /** The parser now stores something else: the next scan re-reads every live session. */
+  reparse?: boolean
+}
+
+/** `SCHEMA_SQL` is this version, frozen. Every later change is a migration. */
+export const BASELINE_VERSION = 10
+
+/**
+ * The migration files, lowest id first. Two branches taking one id add different files, so
+ * git reports no conflict: the first thing to import this module after that merge fails.
+ */
+export function checkMigrations(modules: Record<string, Migration>): Migration[] {
+  const fileOf = new Map<number, string>()
+  for (const [file, m] of Object.entries(modules)) {
+    const prefix = path.basename(file).match(/^(\d{4})-[a-z0-9-]+\.ts$/)?.[1]
+    if (Number(prefix) !== m.id) throw new Error(`${file}: expected NNNN-slug.ts with NNNN matching id ${m.id}`)
+    if (m.id <= BASELINE_VERSION) throw new Error(`${file}: id ${m.id} is not above the baseline v${BASELINE_VERSION}`)
+    const other = fileOf.get(m.id)
+    if (other) throw new Error(`${file} and ${other} both claim id ${m.id}`)
+    fileOf.set(m.id, file)
+  }
+  return Object.values(modules).sort((a, b) => a.id - b.id)
+}
+
+export const MIGRATIONS = checkMigrations(import.meta.glob<Migration>('./migrations/*.ts', { eager: true }))
+
+const latestOf = (migrations: Migration[]) => Math.max(BASELINE_VERSION, ...migrations.map((m) => m.id))
+
+export const SCHEMA_VERSION = latestOf(MIGRATIONS)
 
 /** The file was written by a newer build. This build cannot know what a write would break. */
 export class NewerSchemaError extends Error {
   constructor(readonly version: number) {
-    super(`database is schema v${version}; this build knows up to v${SCHEMA_VERSION}`)
+    super(`database has schema v${version}, which this build (up to v${SCHEMA_VERSION}) does not know`)
   }
 }
 
 /**
  * Opens the vault DB. Only the main process migrates (`migrate: true`, before the
- * index worker starts); the worker opens the already-migrated file.
+ * index worker starts); the worker opens the already-migrated file. `migrations` replaces
+ * the files in `electron/migrations`, so tests can run steps that do not exist.
  */
-export function openVaultDb(dbFile: string, opts: { migrate?: boolean; busyTimeoutMs?: number } = {}): DbHandle {
+export function openVaultDb(
+  dbFile: string,
+  opts: { migrate?: boolean; busyTimeoutMs?: number; migrations?: Migration[] } = {},
+): DbHandle {
   const dir = path.dirname(dbFile)
   fs.mkdirSync(dir, { recursive: true })
   // Two connections share this file (main for queries/user writes, the index worker
@@ -35,7 +75,7 @@ export function openVaultDb(dbFile: string, opts: { migrate?: boolean; busyTimeo
       // schema nothing below writes. The first INSERT must not be where that comes out. It
       // takes a real write: on such a handle BEGIN IMMEDIATE only starts a read transaction.
       db.exec('BEGIN IMMEDIATE; CREATE TABLE write_probe (x); ROLLBACK')
-      migrate(db)
+      migrate(db, opts.migrations ?? MIGRATIONS)
     }
     return db
   } catch (err) {
@@ -52,6 +92,9 @@ export function openVaultDb(dbFile: string, opts: { migrate?: boolean; busyTimeo
 }
 
 /**
+ * The schema at v10, frozen: an edit here would never reach a DB past the baseline, so
+ * every change since is a file in `electron/migrations`.
+ *
  * Tables split into two kinds:
  * - **Index** (projects, sessions, messages, file_refs, plan_files + FTS): derived from
  *   files under ~/.claude, rebuildable — except sessions archived after their source
@@ -281,24 +324,76 @@ export function readSchemaVersion(db: DbHandle): number {
   return row ? Number(row.value) : 0
 }
 
-function migrate(db: DbHandle) {
+function writeSchemaVersion(db: DbHandle, version: number) {
+  db.prepare(
+    `INSERT INTO meta(key, value) VALUES('schema_version', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+  ).run(String(version))
+}
+
+/** Ascending. A DB with no `schema_migrations` has not been through the runner yet. */
+function appliedIds(db: DbHandle): number[] {
+  if (!tableExists(db, 'schema_migrations')) return []
+  return (db.prepare(`SELECT id FROM schema_migrations ORDER BY id`).all() as { id: number }[]).map((r) => r.id)
+}
+
+/**
+ * The version that says a newer build wrote this DB, or null when this build knows all of
+ * it. Comparing numbers is not enough: ids merge out of order, so a DB can hold an id below
+ * this build's latest that this build has never heard of.
+ */
+export function unknownVersion(db: DbHandle, migrations: Migration[] = MIGRATIONS): number | null {
+  const known = new Set(migrations.map((m) => m.id))
+  const unknown = appliedIds(db).filter((id) => !known.has(id))
+  if (unknown.length > 0) return unknown[unknown.length - 1]
   const v = readSchemaVersion(db)
-  if (v > SCHEMA_VERSION) throw new NewerSchemaError(v)
-  if (v > 0 && v < 9) migrateLegacyToV9(db)
-  else if (v === 0 && tableExists(db, 'messages')) migrateLegacyToV9(db)
-  // Superseded by the covering idx_messages_usage_cover (early v9 builds created it).
-  db.exec(`DROP INDEX IF EXISTS idx_messages_usage`)
-  db.exec(SCHEMA_SQL)
-  // v9 → v10: plans follow archive mode. Adding a nullable column needs no re-parse.
-  if (!columns(db, 'plan_files').has('archived_at')) db.exec(`ALTER TABLE plan_files ADD COLUMN archived_at INTEGER`)
-  // From v9 on, a migration must never drop sessions/messages wholesale: archived
-  // sessions exist only in this DB. Re-parse live files by resetting
-  // `sessions.indexed_bytes` instead (see `requestFullReparse`).
-  if (v < SCHEMA_VERSION) {
-    db.prepare(
-      `INSERT INTO meta(key, value) VALUES('schema_version', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
-    ).run(String(SCHEMA_VERSION))
-  }
+  return v > latestOf(migrations) ? v : null
+}
+
+/**
+ * The steps this DB has no record of, lowest id first. Each id is checked on its own, so a
+ * step merged after a higher one has shipped still runs: no `version < x` to skip it.
+ */
+export function pendingMigrations(db: DbHandle, migrations: Migration[] = MIGRATIONS): Migration[] {
+  const applied = new Set(appliedIds(db))
+  return migrations.filter((m) => !applied.has(m.id)).sort((a, b) => a.id - b.id)
+}
+
+function migrate(db: DbHandle, migrations: Migration[]) {
+  const newer = unknownVersion(db, migrations)
+  if (newer != null) throw new NewerSchemaError(newer)
+  // The first migration creates this table, so a DB without it has not finished the baseline.
+  if (!tableExists(db, 'schema_migrations')) applyBaseline(db)
+  for (const m of pendingMigrations(db, migrations)) applyMigration(db, m)
+}
+
+/**
+ * Brings any DB from before the runner to the frozen v10 schema. It stops running once the
+ * first migration has, so a later step can replace an index without this putting it back.
+ * A migration must never drop `sessions`/`messages`: archived sessions exist only in this
+ * DB. Re-parse live files with `reparse: true` instead (see `requestFullReparse`).
+ */
+function applyBaseline(db: DbHandle) {
+  const v = readSchemaVersion(db)
+  if (v < 9 && (v > 0 || tableExists(db, 'messages'))) migrateLegacyToV9(db)
+  db.transaction(() => {
+    // Superseded by the covering idx_messages_usage_cover (early v9 builds created it).
+    db.exec(`DROP INDEX IF EXISTS idx_messages_usage`)
+    db.exec(SCHEMA_SQL)
+    // v9 → v10: plans follow archive mode. Adding a nullable column needs no re-parse.
+    if (!columns(db, 'plan_files').has('archived_at')) db.exec(`ALTER TABLE plan_files ADD COLUMN archived_at INTEGER`)
+    writeSchemaVersion(db, BASELINE_VERSION)
+  })()
+}
+
+/** A step and its record commit together: a failure leaves the DB as the last step did. */
+function applyMigration(db: DbHandle, m: Migration) {
+  db.transaction(() => {
+    m.up(db)
+    if (m.reparse) requestFullReparse(db)
+    db.prepare(`INSERT INTO schema_migrations (id, applied_at) VALUES (?, ?)`).run(m.id, Date.now())
+    const { latest } = db.prepare(`SELECT MAX(id) AS latest FROM schema_migrations`).get() as { latest: number }
+    writeSchemaVersion(db, latest)
+  })()
 }
 
 /** Forces every live (non-archived) session to be parsed from byte 0 on the next scan. */
@@ -350,10 +445,50 @@ export function resolveLegacyKeys(refs: LegacyRef[]): Map<string, string> {
   return out
 }
 
+/** Columns every build from v3 on wrote. A table without them holds nothing to carry over. */
+const LEGACY_CORE: Record<string, string[]> = {
+  projects: ['slug', 'root_path', 'display_name'],
+  sessions: ['project_id', 'rel_path', 'file_path', 'file_mtime_ms', 'message_count'],
+  messages: ['session_id', 'line_index', 'role', 'body'],
+}
+
+/** What builds up to v9 added to those tables, as column definitions. */
+const LEGACY_ADDED: Record<string, string[]> = {
+  projects: [`tool TEXT NOT NULL DEFAULT 'claude'`, 'archived_at INTEGER'],
+  sessions: [
+    'size_bytes INTEGER NOT NULL DEFAULT 0',
+    'indexed_bytes INTEGER NOT NULL DEFAULT 0',
+    'head_hash TEXT',
+    'tail_hash TEXT',
+    'archived_at INTEGER',
+  ],
+  messages: [
+    `message_class TEXT NOT NULL DEFAULT 'dialog'`,
+    'ts_ms INTEGER',
+    'model TEXT',
+    'input_tokens INTEGER',
+    'output_tokens INTEGER',
+    'cache_read_tokens INTEGER',
+    'cache_creation_tokens INTEGER',
+    'cache_creation_1h_tokens INTEGER',
+    'is_sidechain INTEGER NOT NULL DEFAULT 0',
+    'cwd TEXT',
+    'git_branch TEXT',
+    // ADD COLUMN needs a default for NOT NULL; every row gets a real key right after.
+    `msg_key TEXT NOT NULL DEFAULT ''`,
+    'api_msg_id TEXT',
+    'request_id TEXT',
+    'is_prompt INTEGER NOT NULL DEFAULT 0',
+    'prompt_text TEXT',
+  ],
+}
+
 /**
- * v≤8 → v9. Old favorites/tags referenced `messages.id` with ON DELETE CASCADE, so
- * every re-index silently deleted them. Carry them over to stable keys first, then
- * rebuild the derived index tables (the next scan repopulates them).
+ * v≤8 → v9. Old favorites/tags referenced `messages.id` with ON DELETE CASCADE, so every
+ * re-index silently deleted them: they move to stable keys. The rows stay where they are,
+ * since a row whose file has gone is the only copy of that line. New columns are added in
+ * place and the next scan does the rest: `indexed_bytes` is 0, so it re-parses every file
+ * still there and archives the others by the usual rule.
  */
 function migrateLegacyToV9(db: DbHandle) {
   type FavRow = LegacyRef & { createdAt: number; body: string; role: string; project: string; relPath: string }
@@ -388,18 +523,32 @@ function migrateLegacyToV9(db: DbHandle) {
   const keyOf = (r: LegacyRef) => keys.get(`${r.filePath}#${r.lineIndex}`) ?? `${r.filePath}#${r.lineIndex}`
 
   db.transaction(() => {
-    for (const t of ['messages_ai', 'messages_ad', 'messages_au']) db.exec(`DROP TRIGGER IF EXISTS ${t}`)
+    // All derived, and SCHEMA_SQL recreates them under the same names.
+    const attached = db
+      .prepare(
+        `SELECT type, name FROM sqlite_master
+         WHERE type IN ('trigger', 'index') AND sql IS NOT NULL AND tbl_name IN ('projects', 'sessions', 'messages')`,
+      )
+      .all() as { type: string; name: string }[]
+    for (const { type, name } of attached) db.exec(`DROP ${type} ${name}`)
     db.exec(`DROP TABLE IF EXISTS messages_fts`)
     db.exec(`DROP VIEW IF EXISTS messages_searchable`)
-    db.exec(`DROP TABLE IF EXISTS file_refs`)
     if (hasLegacyFavs) db.exec(`DROP TABLE favorites`)
     if (hasLegacyTags) db.exec(`DROP TABLE message_tags`)
-    db.exec(`DROP TABLE IF EXISTS messages`)
-    db.exec(`DROP TABLE IF EXISTS sessions`)
-    if (tableExists(db, 'projects')) {
-      const pc = columns(db, 'projects')
-      if (!pc.has('tool')) db.exec(`ALTER TABLE projects ADD COLUMN tool TEXT NOT NULL DEFAULT 'claude'`)
-      if (!pc.has('archived_at')) db.exec(`ALTER TABLE projects ADD COLUMN archived_at INTEGER`)
+    const carried = Object.entries(LEGACY_CORE).every(([table, core]) => {
+      const have = columns(db, table)
+      return core.every((c) => have.has(c))
+    })
+    if (carried) {
+      for (const [table, added] of Object.entries(LEGACY_ADDED)) {
+        const have = columns(db, table)
+        for (const def of added) if (!have.has(def.split(' ')[0])) db.exec(`ALTER TABLE ${table} ADD COLUMN ${def}`)
+      }
+      db.exec(`UPDATE messages SET msg_key = COALESCE((SELECT file_path FROM sessions s WHERE s.id = session_id), '') || '#' || line_index`)
+    } else {
+      // Tables of these names that no build wrote: nothing to carry over, and not ours to delete.
+      db.exec(`DROP TABLE IF EXISTS file_refs`)
+      for (const table of Object.keys(LEGACY_CORE)) if (tableExists(db, table)) db.exec(`ALTER TABLE ${table} RENAME TO legacy_${table}`)
     }
     if (tableExists(db, 'model_prices') && !columns(db, 'model_prices').has('cache_write_1h_per_mtok')) {
       db.exec(`ALTER TABLE model_prices ADD COLUMN cache_write_1h_per_mtok REAL`)
@@ -413,6 +562,9 @@ function migrateLegacyToV9(db: DbHandle) {
     for (const f of favs) insFav.run(keyOf(f), f.createdAt, f.body, f.role, f.project, f.relPath)
     const insTag = db.prepare(`INSERT OR IGNORE INTO message_tags (msg_key, tag_id) VALUES (?, ?)`)
     for (const t of tagRefs) insTag.run(keyOf(t), t.tagId)
+    // The view SCHEMA_SQL just created has no entries yet for the rows already here.
+    if (carried) db.exec(`INSERT INTO messages_fts(messages_fts) VALUES('rebuild')`)
+    writeSchemaVersion(db, 9)
   })()
 }
 

@@ -3,7 +3,7 @@
   "compilerOptions": {
     "noEmit": true,
     "moduleResolution": "bundler",
-    "types": ["node"]
+    "types": ["node", "vite/client"]
   },
   "include": ["electron/**/*.ts", "shared/**/*.ts"]
 }

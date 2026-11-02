@@ -1,7 +1,17 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import Database from 'better-sqlite3'
-import { getSetting, NewerSchemaError, openVaultDb, readSchemaVersion, SCHEMA_VERSION, tableExists, type DbHandle } from './db.js'
+import {
+  getSetting,
+  NewerSchemaError,
+  openVaultDb,
+  pendingMigrations,
+  readSchemaVersion,
+  SCHEMA_VERSION,
+  tableExists,
+  unknownVersion,
+  type DbHandle,
+} from './db.js'
 import { BACKUP_KEEP_CHOICES, DEFAULT_BACKUP_KEEP, type BackupFile, type BackupReason } from '../shared/ipc.js'
 
 /**
@@ -211,9 +221,9 @@ export function verifyBackup(file: string): void {
     readClosedDb(file, (db) => {
       const check = db.pragma('quick_check', { simple: true })
       if (check !== 'ok') throw new BackupError('invalid', `integrity check failed: ${String(check)}`)
-      const v = readSchemaVersion(db)
-      if (v === 0) throw new BackupError('invalid', 'not a vault database')
-      if (v > SCHEMA_VERSION) throw new BackupError('newer-schema', `backup is schema v${v}; this build reads up to v${SCHEMA_VERSION}`)
+      if (readSchemaVersion(db) === 0) throw new BackupError('invalid', 'not a vault database')
+      const newer = unknownVersion(db)
+      if (newer != null) throw new BackupError('newer-schema', `backup has schema v${newer}; this build reads up to v${SCHEMA_VERSION}`)
     })
   } catch (err) {
     if (err instanceof BackupError) throw err
@@ -394,13 +404,14 @@ function newestQuarantined(dbFile: string): string | null {
   return newest ? path.join(folder, newest) : null
 }
 
-type DbInfo = { version: number; keep: number; empty: boolean }
+type DbInfo = { newer: number | null; pending: boolean; keep: number; empty: boolean }
 
 /** What a DB holds, without migrating it. A failed read is returned for the caller to judge. */
 function peek(dbFile: string): DbInfo | { error: unknown } {
   try {
     return readClosedDb(dbFile, (db) => ({
-      version: readSchemaVersion(db),
+      newer: unknownVersion(db),
+      pending: pendingMigrations(db).length > 0,
       keep: tableExists(db, 'meta') ? backupKeepOf(db) : DEFAULT_BACKUP_KEEP,
       empty: !db.prepare(`SELECT 1 FROM sqlite_master LIMIT 1`).get(),
     }))
@@ -411,10 +422,11 @@ function peek(dbFile: string): DbInfo | { error: unknown } {
 
 /**
  * Opens (and migrates) the vault DB at startup.
- * - A DB from a newer build is refused untouched.
- * - Before a schema migration, the old file is copied to the backup folder. A migration
- *   never runs without that copy (unless backups are off), so a DB whose version cannot be
- *   read is not opened at all.
+ * - A DB from a newer build (a version above this build's, or a migration id it does not
+ *   know) is refused untouched.
+ * - With any migration pending, the old file is first copied to the backup folder. A
+ *   migration never runs without that copy (unless backups are off), so a DB whose state
+ *   cannot be read is not opened at all.
  * - Only a DB that is actually damaged (`SQLITE_CORRUPT`, `SQLITE_NOTADB`) is quarantined
  *   (kept on disk), and the newest backup that opens takes its place; only when none does
  *   is an empty DB created for a fresh index. A locked file, a full disk or a read-only
@@ -436,7 +448,7 @@ export function openVaultDbWithRecovery(
       console.error('[vault] database is damaged:', info.error)
       return recover(dbFile, dir, now, open)
     }
-    if (info.version > SCHEMA_VERSION) return newerBuild(info.version)
+    if (info.newer != null) return newerBuild(info.newer)
     // Asked before SQLite gets the file: it would open it read-only regardless and leave
     // sidecars with the file's mode, which would fail the retry after the user fixes the DB.
     for (const suffix of ['', ...SIDECARS]) {
@@ -446,7 +458,7 @@ export function openVaultDbWithRecovery(
         return retryable(err, dbFile + suffix)
       }
     }
-    if (info.version < SCHEMA_VERSION && !info.empty && info.keep > 0) {
+    if (info.pending && !info.empty && info.keep > 0) {
       try {
         copyClosedDb(dbFile, dir, 'pre-migration', now)
       } catch (err) {

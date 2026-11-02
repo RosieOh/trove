@@ -8,7 +8,7 @@
     "moduleResolution": "bundler",
     "strict": true,
     "noEmit": true,
-    "types": ["node"]
+    "types": ["node", "vite/client"]
   },
   "include": ["vite.config.ts", "electron/**/*.ts", "scripts/**/*.ts", "shared/**/*.ts"]
 }
