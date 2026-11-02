@@ -1,6 +1,7 @@
 # Changelog
 
-All notable changes to this project are documented in this file.
+All notable changes to this project are documented in this file. Changes not yet released
+are fragments in [`changes/`](changes/README.md) until a release moves them here.
 
 ## [Unreleased]
 
