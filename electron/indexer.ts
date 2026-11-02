@@ -300,9 +300,12 @@ export function reconcileMissing(db: DbHandle, adapter: ToolAdapter, mode: Archi
   const projects = db
     .prepare(`SELECT id, root_path FROM projects WHERE tool = ? AND archived_at IS NULL`)
     .all(adapter.id) as { id: number; root_path: string }[]
+  // Deleting a project cascades to its sessions, and mirror mode applies only to live ones:
+  // a project holding an archived session stays, archived, until a purge removes both.
+  const holdsArchive = db.prepare(`SELECT 1 FROM sessions WHERE project_id = ? AND archived_at IS NOT NULL LIMIT 1`)
   for (const p of projects) {
     if (fs.existsSync(p.root_path)) continue
-    if (mode === 'keep') db.prepare(`UPDATE projects SET archived_at = ? WHERE id = ?`).run(now, p.id)
+    if (mode === 'keep' || holdsArchive.get(p.id)) db.prepare(`UPDATE projects SET archived_at = ? WHERE id = ?`).run(now, p.id)
     else db.prepare(`DELETE FROM projects WHERE id = ?`).run(p.id)
     changed += 1
   }
