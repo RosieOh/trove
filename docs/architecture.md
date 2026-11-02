@@ -272,7 +272,7 @@ Every other count on the Stats tab is by line too, not by row: a forked session 
 archived generation hold the same line more than once. Totals read `idx_messages_key`,
 prompts their partial index, and role counts take the repeated rows back off the covering
 `idx_messages_class_role`. On a synthetic 750k rows (617 MB), warm: 63 ms when counting rows,
-155 ms now with no line repeated, 270 ms with 5% of lines repeated, 610 ms with 25%.
+155 ms now with no line repeated, 270 ms with 5% more rows repeating lines, 610 ms with 25%.
 
 `shared/pricing.ts` prices the result:
 
