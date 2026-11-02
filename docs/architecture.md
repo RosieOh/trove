@@ -77,8 +77,8 @@ See [ADR-0006](decisions/0006-stable-keys-append-indexing-archive.md).
   byte. Rows are written in transactions of 2,000 lines; the worker yields between them.
 - **Append-only resume.** `sessions` stores `indexed_bytes` and SHA-1 fingerprints of the
   first 4 KB and of the 256 bytes before the offset. If both still match, only new bytes
-  are parsed and existing rows (and ids) are untouched. Otherwise the file is re-read from
-  0, keeping the session id. A trailing line without `\n` that is not valid JSON yet is
+  are parsed and existing rows (and ids) are untouched. Otherwise the file is different
+  content (see **Archive**). A trailing line without `\n` that is not valid JSON yet is
   left for the next event.
 - **Stable keys.** `messages.msg_key` = line `uuid` (Codex `payload.id`), else `file#line`.
 - **Archive.** When a source file disappears the session gets `archived_at` (setting
@@ -86,11 +86,20 @@ See [ADR-0006](decisions/0006-stable-keys-append-indexing-archive.md).
   for an adapter whose root is missing, and a watcher deletion event under a root that no
   longer exists is ignored. Plans (`plan_files.archived_at`) follow the same mode and the
   same guard. Purging archived rows (sessions and plans) is an explicit action.
+- **A file that comes back different.** When the fingerprints do not match an archived
+  session (either mode) or a live one in Keep mode, the old row is renamed to
+  `<file_path>#archived-<ms>` (`rel_path` gets the same suffix), keeps its messages and is
+  marked archived, and the file gets a new session row. Renaming is one `UPDATE`; moving
+  the messages to a new row would rewrite each one through the FTS triggers. Lines that
+  kept their uuid then exist in both generations, so search shows both, like a forked
+  session. Mirror mode replaces a live session's rows in place, and so does a row reset by
+  `requestFullReparse` (`head_hash` NULL) and a row with no messages.
 - **Live updates.** chokidar v4 watches the roots (globs were removed in v4), filters
   `.jsonl` / `.md`, and the main process forwards batched events every 300 ms.
 - **Adapters** (`electron/adapters.ts`) provide `listProjects`, `listSessions`,
   `projectForFile`, `createParser` and whether the format is `appendable` (Codex is
-  stateful — model and cwd are announced once — so its files are re-read on change).
+  stateful — model and cwd are announced once — so a file that has only grown is re-read in
+  place).
 
 ## JSONL parsing
 
@@ -160,7 +169,9 @@ User data (never derivable — never dropped by a migration):
 re-parse, call `requestFullReparse` (resets `indexed_bytes`). The v≤8 → v9 migration moved
 favorites/tags to stable keys by re-reading the referenced lines, then rebuilt the index
 tables. v9 → v10 adds `plan_files.archived_at` in place (no re-parse). Before any migration
-the old file is copied to the backup folder. Document every bump here.
+the old file is copied to the backup folder, and if that copy fails the migration does not
+run (unless backups are off). A DB with a version above `SCHEMA_VERSION` is never written.
+Document every bump here.
 
 ## Backups
 
@@ -175,13 +186,30 @@ is the only copy of deleted transcripts, so it is snapshotted:
 | Before "Delete all archived" (purge refused if it fails) | `VACUUM INTO` | index worker |
 | Before a restore | rename of the live file | main, all connections closed |
 
-The newest `backupKeep` (0 / 1 / **3** / 7) are kept. 0 stops automatic snapshots without
+The newest `backupKeep` (0 / 1 / **3** / 7) dailies are kept, plus the latest 2 of each
+other reason, so dailies never push out a safety copy. 0 stops automatic snapshots without
 deleting any. Snapshots are skipped below 1.2× the DB size of free space.
-`openVaultDbWithRecovery` quarantines a DB that will not open (`vault.db.corrupt-<time>`)
-and installs the newest backup that passes `verifyBackup`: `quick_check`, a vault schema
-no newer than `SCHEMA_VERSION`. Only when no backup passes is an empty DB created; either
-way a dialog says what happened. Restore verifies first, then closes every connection,
-swaps the files and relaunches the app.
+
+`openVaultDbWithRecovery` returns one of:
+
+| Outcome | When | What happens |
+|---------|------|--------------|
+| `ok` | The DB opened | |
+| `recovered` | `SQLITE_CORRUPT` / `SQLITE_NOTADB` | Quarantined (`vault.db.corrupt-<time>`), newest backup that passes `verifyBackup` installed (`quick_check`, a vault schema no newer than `SCHEMA_VERSION`), dialog |
+| `rebuilt` | The same, and no backup passes | Quarantined, empty DB created, dialog |
+| `retryable` + code | Anything else: busy, disk full, permissions | No DB handle, no file swapped; dialog with the path, the code, Try again and Quit |
+| `newer-build` | Schema above `SCHEMA_VERSION` | No DB handle, no write; dialog with the versions, the path and Quit |
+
+Quarantine is all or nothing: a failed rename puts back what had moved and the outcome is
+`retryable`. So is a failure while installing a backup or creating the empty DB that is not
+about the backup, and the corrupt file is put back so the next attempt recovers it instead
+of finding no DB. The main process also shows a dialog with the path and Quit when a
+read-only data folder stops Chromium taking the single-instance lock, which happens before
+the DB is opened. Restore verifies first, then closes every connection, swaps the files and
+relaunches the app.
+
+Everything that sends to the renderer asks for the current window (`liveWindow`): on macOS
+the app and its workers outlive a closed window, and a later one can take its place.
 
 ## Search
 
@@ -260,9 +288,11 @@ helpers in `src/format.ts`. The visual system — tokens and glass component cla
   against a temporary copy of `tests/e2e/fixtures` (Claude sessions, a plan, a Codex
   rollout; `CLAUDE_HOME` / `CODEX_HOME` / `VAULT_USER_DATA` point into it). It covers
   startup, indexing, UI search, prompts, stats, plans, Codex, live append, archiving on
-  delete and the daily backup. It also checks that the renderer logs no errors, that the
-  app quits cleanly and that nothing was written under the transcript roots. CI runs it on
-  macOS, Windows and Linux (`xvfb-run`, `--no-sandbox`).
+  delete, indexing with the window closed and the daily backup. It also checks that the
+  renderer logs no errors, that the app quits cleanly and that nothing was written under
+  the transcript roots. Startups that end in a dialog (a newer-build DB, a read-only data
+  folder) run without Playwright, with `tests/e2e/record-dialogs.cjs` answering the dialog.
+  CI runs it on macOS, Windows and Linux (`xvfb-run`, `--no-sandbox`).
 
 ## Packaging
 
