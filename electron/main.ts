@@ -528,8 +528,16 @@ function registerIpc() {
     try {
       restoreBackup(vaultDbPath(), backupsDir(), name)
     } catch (err) {
-      // Relaunch anyway: startup recovery opens whatever DB (or backup) is usable.
+      // Relaunch anyway: the old DB is back in place, or startup finds it among the backups.
       console.error('[vault] restore failed:', err)
+      const s = MAIN_STRINGS[mainLocale()]
+      await dialog.showMessageBox({
+        type: 'error',
+        title: APP_NAME,
+        message: s.restoreFailed,
+        detail: fillText(s.restoreFailedDetail, { file: vaultDbPath(), code: (err as NodeJS.ErrnoException).code ?? 'UNKNOWN' }),
+        buttons: [s.continue],
+      })
     }
     app.relaunch()
     app.exit(0)
@@ -721,9 +729,15 @@ const MAIN_STRINGS = {
     recoveredDetail: '{from} 백업을 썼어요. 그 뒤 바뀐 대화는 ~/.claude에서 다시 색인해요.\n\n열리지 않은 파일은 지우지 않고 남겨 뒀어요:\n{file}',
     rebuilt: '색인 DB를 열 수 없어서 새로 만들었어요.',
     rebuiltDetail: '쓸 수 있는 백업이 없었어요. ~/.claude에서 다시 색인해요. 보관돼 있던 대화와 즐겨찾기·태그는 아래 파일에 남아 있어요:\n{file}',
+    recoveredMissing: '색인 DB 파일이 없어져서 백업으로 되돌렸어요.',
+    recoveredMissingDetail: '{from} 백업을 썼어요. 그 뒤 바뀐 대화는 ~/.claude에서 다시 색인해요.',
+    rebuiltMissing: '색인 DB 파일이 없어져서 새로 만들었어요.',
+    rebuiltMissingDetail: '쓸 수 있는 백업이 없었어요. ~/.claude에서 다시 색인해요. 백업 폴더는 그대로 뒀어요:\n{file}',
+    restoreFailed: '백업으로 되돌리지 못했어요.',
+    restoreFailedDetail: '쓰던 DB는 그대로예요. 디스크 공간과 쓰기 권한을 확인한 뒤 다시 시도해 주세요.\n\n{file}\n\n오류 코드: {code}',
     retryBusy: '다른 프로그램이 색인 DB를 쓰고 있어서 열지 못했어요.',
     retryFull: '디스크 공간이 부족해서 색인 DB를 열지 못했어요.',
-    retryDenied: '이 폴더에 쓸 수 없어서 색인 DB를 열지 못했어요.',
+    retryDenied: '이 위치에 쓸 수 없어서 색인 DB를 열지 못했어요.',
     retryOther: '색인 DB를 지금은 열 수 없어요.',
     retryDetail: 'DB는 그대로 두었어요. 원인을 해결한 뒤 다시 시도해 주세요.\n\n{file}\n\n오류 코드: {code}',
     newerBuild: '이 색인 DB는 더 새로운 Trove에서 만들어졌어요.',
@@ -741,9 +755,15 @@ const MAIN_STRINGS = {
     recoveredDetail: 'Restored from {from}. Conversations changed since then are re-indexed from ~/.claude.\n\nThe file that failed to open was kept:\n{file}',
     rebuilt: 'The index database could not be opened, so a new one was created.',
     rebuiltDetail: 'No usable backup was found. Everything is re-indexed from ~/.claude. Archived conversations, favorites and tags are still in this file:\n{file}',
+    recoveredMissing: 'The index database file was missing, so a backup was restored.',
+    recoveredMissingDetail: 'Restored from {from}. Conversations changed since then are re-indexed from ~/.claude.',
+    rebuiltMissing: 'The index database file was missing, so a new one was created.',
+    rebuiltMissingDetail: 'No usable backup was found. Everything is re-indexed from ~/.claude. The backup folder was left as it is:\n{file}',
+    restoreFailed: 'The backup could not be restored.',
+    restoreFailedDetail: 'The database you were using is still in place. Check the free disk space and write permission, then try again.\n\n{file}\n\nError code: {code}',
     retryBusy: 'Another program is using the index database, so it could not be opened.',
     retryFull: 'There is not enough disk space to open the index database.',
-    retryDenied: 'The index database could not be opened because this folder cannot be written to.',
+    retryDenied: 'The index database could not be opened because this location cannot be written to.',
     retryOther: 'The index database cannot be opened right now.',
     retryDetail: 'The database was left as it is. Fix the cause, then try again.\n\n{file}\n\nError code: {code}',
     newerBuild: 'This index database was made by a newer version of Trove.',
@@ -763,12 +783,20 @@ function reportOpenOutcome(outcome: OpenOutcome) {
   const win = liveWindow()
   if (outcome.kind === 'ok' || !win) return
   const s = MAIN_STRINGS[mainLocale()]
-  const values = { file: outcome.quarantined, from: outcome.kind === 'recovered' ? outcome.from : '' }
+  const recovered = outcome.kind === 'recovered'
+  // Nothing quarantined means the DB was simply gone: there is no file of its to point at.
+  const [message, detail] = outcome.quarantined
+    ? recovered
+      ? [s.recovered, s.recoveredDetail]
+      : [s.rebuilt, s.rebuiltDetail]
+    : recovered
+      ? [s.recoveredMissing, s.recoveredMissingDetail]
+      : [s.rebuiltMissing, s.rebuiltMissingDetail]
   void dialog.showMessageBox(win, {
-    type: outcome.kind === 'recovered' ? 'info' : 'warning',
+    type: recovered ? 'info' : 'warning',
     title: APP_NAME,
-    message: outcome.kind === 'recovered' ? s.recovered : s.rebuilt,
-    detail: fillText(outcome.kind === 'recovered' ? s.recoveredDetail : s.rebuiltDetail, values),
+    message,
+    detail: fillText(detail, { file: outcome.quarantined ?? backupsDir(), from: recovered ? outcome.from : '' }),
     buttons: [s.continue],
   })
 }
@@ -798,7 +826,7 @@ async function openVaultDbOrAsk(): Promise<Extract<OpenResult, { db: DbHandle }>
       type: 'warning',
       title: APP_NAME,
       message: messages[retryCause(outcome.code)],
-      detail: fillText(s.retryDetail, { file: vaultDbPath(), code: outcome.code }),
+      detail: fillText(s.retryDetail, { file: outcome.path, code: outcome.code }),
       buttons: [s.retry, s.quit],
       defaultId: 0,
       cancelId: 1,

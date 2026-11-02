@@ -385,6 +385,31 @@ try {
     assert.equal(fs.existsSync(path.join(dataDir, 'backups')), false)
   })
 
+  await step('a DB that went missing comes back from its backup, and the user is told', async () => {
+    const files = fs.readdirSync(userData).filter((f) => /^vault\.db(-wal|-shm)?$/.test(f))
+    for (const f of files) fs.rmSync(path.join(userData, f))
+    const log = path.join(tmp, 'dialogs-missing.jsonl')
+    app = await _electron.launch({
+      executablePath: require('electron'),
+      args: ['-r', path.join(root, 'tests', 'e2e', 'record-dialogs.cjs'), ...args],
+      env: { ...env, E2E_DIALOG_LOG: log },
+      timeout: 60_000,
+    })
+    page = await app.firstWindow()
+    const dialogs = await until(() => (fs.existsSync(log) ? fs.readFileSync(log, 'utf8').trim().split('\n').map((l) => JSON.parse(l)) : null), {
+      what: 'the recovery dialog',
+    })
+    assert.equal(dialogs.length, 1, JSON.stringify(dialogs))
+    assert.match(dialogs[0].detail, /vault-\d{8}-\d{6}-daily\.db/)
+    // The session deleted earlier exists only in the vault, so only the backup can bring it back.
+    await until(async () => {
+      const hits = await vault(() => window.vault.search({ query: 'archivedsentinel', limit: 5 }))
+      return hits?.length === 1 && hits[0].archived === true
+    }, { timeout: 30_000, what: 'the archived session in the restored DB' })
+    await app.close()
+    app = null
+  })
+
   // A chmod means nothing to Windows, and root ignores it.
   if (process.platform !== 'win32' && process.getuid?.() !== 0) {
     await step('a read-only data folder explains itself instead of quitting silently', async () => {
@@ -399,6 +424,48 @@ try {
         assert.equal(dialogs[0].buttons.length, 1, 'only a quit button')
       } finally {
         fs.chmodSync(dataDir, 0o755)
+      }
+    })
+
+    await step('a read-only DB file in a writable folder offers a retry instead of opening', async () => {
+      const dataDir = path.join(tmp, 'user-readonly-db')
+      fs.mkdirSync(dataDir)
+      const dbFile = path.join(dataDir, 'vault.db')
+      fs.copyFileSync(path.join(userData, 'vault.db'), dbFile)
+      fs.chmodSync(dbFile, 0o444)
+      const bytes = fs.readFileSync(dbFile)
+      const { code, dialogs } = await launchToDialog(dataDir)
+      fs.chmodSync(dbFile, 0o644)
+      assert.equal(code, 0)
+      assert.equal(dialogs.length, 1, JSON.stringify(dialogs))
+      assert.ok(dialogs[0].detail.includes(dbFile), dialogs[0].detail)
+      assert.match(dialogs[0].detail, /EACCES/)
+      assert.equal(dialogs[0].buttons.length, 2, 'try again and quit')
+      assert.ok(fs.readFileSync(dbFile).equals(bytes), 'the DB changed')
+      assert.deepEqual(fs.readdirSync(dataDir).filter((f) => f.startsWith('vault.db') && f !== 'vault.db'), [])
+    })
+
+    await step('a backup folder that cannot be written is the path the dialog names', async () => {
+      const dataDir = path.join(tmp, 'user-readonly-backups')
+      const backups = path.join(dataDir, 'backups')
+      fs.mkdirSync(backups, { recursive: true })
+      const dbFile = path.join(dataDir, 'vault.db')
+      const Database = require('better-sqlite3')
+      const db = new Database(dbFile)
+      db.exec(`CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        INSERT INTO meta VALUES ('schema_version', '9');`)
+      db.close()
+      const bytes = fs.readFileSync(dbFile)
+      fs.chmodSync(backups, 0o555)
+      try {
+        const { code, dialogs } = await launchToDialog(dataDir)
+        assert.equal(code, 0)
+        assert.equal(dialogs.length, 1, JSON.stringify(dialogs))
+        assert.ok(dialogs[0].detail.includes(backups), dialogs[0].detail)
+        assert.match(dialogs[0].detail, /EACCES/)
+        assert.ok(fs.readFileSync(dbFile).equals(bytes), 'migrated with no copy')
+      } finally {
+        fs.chmodSync(backups, 0o755)
       }
     })
   }

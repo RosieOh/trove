@@ -174,6 +174,161 @@ describe('restore', () => {
     expect(() => verifyBackup(junk)).toThrow()
     expect(() => verifyBackup(path.join(backups, 'vault-20200101-000000-daily.db'))).toThrow(/not found/)
   })
+
+  it('puts the live DB back when the backup cannot be installed', async () => {
+    const { db, dbFile, backups } = await seeded()
+    const good = snapshot(db, backups, 'manual', new Date(Date.UTC(2026, 9, 1)))
+    db.close()
+    fs.writeFileSync(`${dbFile}-wal`, 'the wal')
+    const copy = fs.copyFileSync
+    vi.spyOn(fs, 'copyFileSync').mockImplementation((from, to, mode) => {
+      if (String(to).endsWith('.restoring')) throw coded('ENOSPC')
+      copy(from, to, mode)
+    })
+
+    expect(() => restoreBackup(dbFile, backups, good.name)).toThrow(/ENOSPC/)
+    vi.restoreAllMocks()
+    expect(fs.readFileSync(`${dbFile}-wal`, 'utf8')).toBe('the wal')
+    fs.rmSync(`${dbFile}-wal`)
+    expect(listBackups(backups).map((b) => b.name)).toEqual([good.name])
+    expect(fs.existsSync(`${dbFile}.restoring`)).toBe(false)
+    const live = readOnly(dbFile)
+    expect(listFavorites(live)).toHaveLength(1)
+    live.close()
+  })
+
+  it('leaves every file in place when the live DB will not move', async () => {
+    const { db, dbFile, backups } = await seeded()
+    const good = snapshot(db, backups, 'manual', new Date(Date.UTC(2026, 9, 1)))
+    db.close()
+    fs.writeFileSync(`${dbFile}-wal`, 'the wal')
+    const rename = fs.renameSync
+    vi.spyOn(fs, 'renameSync').mockImplementation((from, to) => {
+      if (String(from) === dbFile) throw coded('EBUSY')
+      rename(from, to)
+    })
+
+    expect(() => restoreBackup(dbFile, backups, good.name)).toThrow(/EBUSY/)
+    vi.restoreAllMocks()
+    expect(fs.readFileSync(`${dbFile}-wal`, 'utf8')).toBe('the wal')
+    expect(listBackups(backups).map((b) => b.name)).toEqual([good.name])
+  })
+
+  it('finds the old DB at the next launch even when it could not be put back', async () => {
+    const { db, dbFile, backups } = await seeded()
+    const good = snapshot(db, backups, 'manual', new Date(Date.UTC(2026, 9, 1)))
+    removeFavorite(db, 'u1')
+    db.close()
+    const { copyFileSync: copy, renameSync: rename } = fs
+    vi.spyOn(fs, 'copyFileSync').mockImplementation((from, to, mode) => {
+      if (String(to).endsWith('.restoring')) throw coded('ENOSPC')
+      copy(from, to, mode)
+    })
+    vi.spyOn(fs, 'renameSync').mockImplementation((from, to) => {
+      if (String(to) === dbFile) throw coded('EPERM')
+      rename(from, to)
+    })
+
+    expect(() => restoreBackup(dbFile, backups, good.name, new Date(Date.UTC(2026, 9, 2)))).toThrow(/ENOSPC/)
+    vi.restoreAllMocks()
+    expect(fs.existsSync(dbFile)).toBe(false)
+
+    const opened = openVaultDbWithRecovery(dbFile, backups)
+    expect(opened.outcome).toMatchObject({ kind: 'recovered', from: 'vault-20261002-000000-pre-restore.db', quarantined: null })
+    // That file is the DB as the user left it, so the favorite they had removed stays removed.
+    expect(listFavorites(opened.db!)).toHaveLength(0)
+    opened.db!.close()
+  })
+})
+
+describe('a launch that finds no DB', () => {
+  it('creates one quietly when nothing says there ever was one', () => {
+    const sb = sandbox()
+    const opened = openVaultDbWithRecovery(sb.dbFile, path.join(sb.dir, 'backups'))
+    expect(opened.outcome).toEqual({ kind: 'ok' })
+    expect(count(opened.db!, 'messages')).toBe(0)
+    opened.db!.close()
+  })
+
+  it('restores the newest usable backup and says so', async () => {
+    const { db, dbFile, backups } = await seeded()
+    snapshot(db, backups, 'daily', new Date(Date.UTC(2026, 9, 1)))
+    const newest = snapshot(db, backups, 'daily', new Date(Date.UTC(2026, 9, 2)))
+    db.close()
+    fs.writeFileSync(path.join(backups, newest.name), 'garbage'.repeat(200))
+    fs.rmSync(dbFile)
+
+    const opened = openVaultDbWithRecovery(dbFile, backups)
+    expect(opened.outcome).toEqual({ kind: 'recovered', from: 'vault-20261001-000000-daily.db', quarantined: null })
+    expect(listFavorites(opened.db!)).toHaveLength(1)
+    opened.db!.close()
+
+    // That was a one-off: the next launch is an ordinary one.
+    const again = openVaultDbWithRecovery(dbFile, backups)
+    expect(again.outcome).toEqual({ kind: 'ok' })
+    again.db!.close()
+  })
+
+  it('finishes a recovery that stopped after the quarantine (a crash, a power cut)', async () => {
+    const { db, dbFile, backups } = await seeded()
+    snapshot(db, backups, 'daily', new Date(Date.UTC(2026, 9, 1)))
+    db.close()
+    const corrupt = `${dbFile}.corrupt-2026-10-02T00-00-00-000Z`
+    fs.writeFileSync(corrupt, 'garbage'.repeat(200))
+    fs.writeFileSync(`${dbFile}.corrupt-2026-09-01T00-00-00-000Z`, 'an older one')
+    fs.writeFileSync(`${corrupt}-wal`, 'its wal')
+    fs.rmSync(dbFile)
+
+    const opened = openVaultDbWithRecovery(dbFile, backups)
+    expect(opened.outcome).toEqual({ kind: 'recovered', from: 'vault-20261001-000000-daily.db', quarantined: corrupt })
+    expect(listFavorites(opened.db!)).toHaveLength(1)
+    opened.db!.close()
+    expect(fs.readFileSync(corrupt, 'utf8')).toMatch(/^garbage/)
+  })
+
+  it('says so when only a quarantined file is left', async () => {
+    const { db, dbFile, backups } = await seeded()
+    db.close()
+    const corrupt = `${dbFile}.corrupt-2026-10-02T00-00-00-000Z`
+    fs.renameSync(dbFile, corrupt)
+
+    const opened = openVaultDbWithRecovery(dbFile, backups)
+    expect(opened.outcome).toEqual({ kind: 'rebuilt', quarantined: corrupt })
+    expect(count(opened.db!, 'messages')).toBe(0)
+    opened.db!.close()
+  })
+
+  it('says so when no backup is usable either', async () => {
+    const { db, dbFile, backups } = await seeded()
+    const only = snapshot(db, backups, 'daily', new Date(Date.UTC(2026, 9, 1)))
+    db.close()
+    fs.writeFileSync(path.join(backups, only.name), 'garbage'.repeat(200))
+    fs.rmSync(dbFile)
+
+    const opened = openVaultDbWithRecovery(dbFile, backups)
+    expect(opened.outcome).toEqual({ kind: 'rebuilt', quarantined: null })
+    opened.db!.close()
+    expect(fs.existsSync(path.join(backups, only.name))).toBe(true)
+  })
+
+  it('creates nothing when the backup cannot be installed, so the next attempt recovers it', async () => {
+    const { db, dbFile, backups } = await seeded()
+    snapshot(db, backups, 'daily', new Date(Date.UTC(2026, 9, 1)))
+    db.close()
+    fs.rmSync(dbFile)
+    const copy = vi.spyOn(fs, 'copyFileSync').mockImplementation(() => {
+      throw coded('ENOSPC')
+    })
+
+    const full = openVaultDbWithRecovery(dbFile, backups)
+    copy.mockRestore()
+    expect(full.outcome).toEqual({ kind: 'retryable', code: 'ENOSPC', path: dbFile })
+    expect(fs.existsSync(dbFile)).toBe(false)
+
+    const again = openVaultDbWithRecovery(dbFile, backups)
+    expect(again.outcome.kind).toBe('recovered')
+    again.db!.close()
+  })
 })
 
 describe('startup recovery', () => {
@@ -275,7 +430,7 @@ describe('an open that fails for any other reason swaps nothing', () => {
 
     const opened = openVaultDbWithRecovery(dbFile, backups, new Date(), (f) => openVaultDb(f, { busyTimeoutMs: 50 }))
     expect(opened.db).toBeNull()
-    expect(opened.outcome).toMatchObject({ kind: 'retryable', code: 'SQLITE_BUSY' })
+    expect(opened.outcome).toEqual({ kind: 'retryable', code: 'SQLITE_BUSY', path: dbFile })
     expect(quarantinedFiles(dbFile)).toEqual([])
 
     // The retry the dialog offers: the lock is gone and the same file opens with its data.
@@ -345,6 +500,83 @@ describe('an open that fails for any other reason swaps nothing', () => {
     },
   )
 
+  // SQLite opens a file it may not write read-only without saying so, and for a current
+  // schema nothing at open time writes: only the first INSERT would have found out.
+  it.skipIf(process.platform === 'win32' || process.getuid?.() === 0)(
+    'reports a read-only DB file in a writable folder as retryable and keeps it',
+    async () => {
+      const { db, dbFile, backups } = await seeded()
+      db.close()
+      const bytes = fs.readFileSync(dbFile)
+      fs.chmodSync(dbFile, 0o444)
+      try {
+        const opened = openVaultDbWithRecovery(dbFile, backups)
+        opened.db?.close()
+        expect(opened.db).toBeNull()
+        expect(opened.outcome).toMatchObject({ kind: 'retryable', path: dbFile })
+        if (opened.outcome.kind !== 'retryable') throw new Error('unreachable')
+        expect(retryCause(opened.outcome.code)).toBe('denied')
+        expect(quarantinedFiles(dbFile)).toEqual([])
+      } finally {
+        fs.chmodSync(dbFile, 0o644)
+      }
+      expect(fs.readFileSync(dbFile).equals(bytes)).toBe(true)
+
+      // The retry the dialog offers, once the permission is back.
+      const again = openVaultDbWithRecovery(dbFile, backups)
+      expect(again.outcome.kind).toBe('ok')
+      expect(listFavorites(again.db!)).toHaveLength(1)
+      setSetting(again.db!, 'autoUpdate', 'off')
+      again.db!.close()
+    },
+  )
+
+  it.skipIf(process.platform === 'win32' || process.getuid?.() === 0)(
+    'names a sidecar left read-only, which fails the open just the same',
+    async () => {
+      const { db, dbFile, backups } = await seeded()
+      db.close()
+      // What an earlier build's open left: SQLite gives sidecars the mode of the DB file.
+      fs.chmodSync(dbFile, 0o444)
+      const earlier = new Database(dbFile)
+      earlier.prepare(`SELECT 1 FROM meta`).get()
+      earlier.close()
+      fs.chmodSync(dbFile, 0o644)
+
+      const opened = openVaultDbWithRecovery(dbFile, backups)
+      opened.db?.close()
+      expect(opened.outcome).toMatchObject({ kind: 'retryable', code: 'EACCES', path: expect.stringMatching(/vault\.db-(wal|shm)$/) })
+    },
+  )
+
+  it.skipIf(process.platform === 'win32' || process.getuid?.() === 0)(
+    'catches a handle that cannot write even when the permissions look fine',
+    async () => {
+      const { db, dbFile, backups } = await seeded()
+      db.close()
+      fs.chmodSync(dbFile, 0o444)
+      vi.spyOn(fs, 'accessSync').mockImplementation(() => {})
+      try {
+        const opened = openVaultDbWithRecovery(dbFile, backups)
+        opened.db?.close()
+        expect(opened.db).toBeNull()
+        expect(opened.outcome).toMatchObject({ kind: 'retryable', path: dbFile })
+        if (opened.outcome.kind !== 'retryable') throw new Error('unreachable')
+        expect(opened.outcome.code).toMatch(/^SQLITE_READONLY/)
+      } finally {
+        fs.chmodSync(dbFile, 0o644)
+      }
+    },
+  )
+
+  it('does not wait for the first write to report a lock on a current DB', async () => {
+    const { db, dbFile, backups } = await seeded()
+    db.exec('BEGIN IMMEDIATE')
+    const opened = openVaultDbWithRecovery(dbFile, backups, new Date(), (f) => openVaultDb(f, { busyTimeoutMs: 50 }))
+    db.exec('ROLLBACK')
+    expect(opened.outcome).toEqual({ kind: 'retryable', code: 'SQLITE_BUSY', path: dbFile })
+  })
+
   it('does not migrate when the pre-migration copy cannot be made', async () => {
     const { db, dbFile, backups } = await seeded()
     db.prepare(`UPDATE meta SET value = ? WHERE key = 'schema_version'`).run(String(SCHEMA_VERSION - 1))
@@ -356,12 +588,109 @@ describe('an open that fails for any other reason swaps nothing', () => {
     const opened = openVaultDbWithRecovery(dbFile, backups)
     copy.mockRestore()
     expect(opened.db).toBeNull()
-    expect(opened.outcome).toMatchObject({ kind: 'retryable', code: 'ENOSPC' })
+    // The dialog points at the folder that needs the space, not at the DB.
+    expect(opened.outcome).toEqual({ kind: 'retryable', code: 'ENOSPC', path: backups })
     // A partial copy must not eat the space the retry needs.
     expect(fs.readdirSync(backups)).toEqual([])
     const check = readOnly(dbFile)
     expect(readSchemaVersion(check)).toBe(SCHEMA_VERSION - 1)
     check.close()
+  })
+
+  it.skipIf(process.platform === 'win32' || process.getuid?.() === 0)(
+    'names the backup folder when that is what cannot be written',
+    async () => {
+      const { db, dbFile, backups } = await seeded()
+      db.prepare(`UPDATE meta SET value = ? WHERE key = 'schema_version'`).run(String(SCHEMA_VERSION - 1))
+      db.close()
+      fs.mkdirSync(backups)
+      fs.chmodSync(backups, 0o555)
+      try {
+        const opened = openVaultDbWithRecovery(dbFile, backups)
+        expect(opened.outcome).toEqual({ kind: 'retryable', code: 'EACCES', path: backups })
+      } finally {
+        fs.chmodSync(backups, 0o755)
+      }
+    },
+  )
+})
+
+describe('a migration never runs without its copy', () => {
+  async function oneBehind() {
+    const { db, dbFile, backups } = await seeded()
+    db.prepare(`UPDATE meta SET value = ? WHERE key = 'schema_version'`).run(String(SCHEMA_VERSION - 1))
+    return { db, dbFile, backups }
+  }
+  const versionOf = (dbFile: string) => {
+    const check = readOnly(dbFile)
+    const version = readSchemaVersion(check)
+    check.close()
+    return version
+  }
+
+  it(
+    'refuses when a lock outlasts the version check, even if it would be gone by the open',
+    async () => {
+      const { db, dbFile, backups } = await oneBehind()
+      db.pragma('locking_mode = EXCLUSIVE')
+      setSetting(db, 'autoUpdate', 'off')
+
+      const opened = openVaultDbWithRecovery(dbFile, backups)
+      opened.db?.close()
+      expect(opened.outcome).toEqual({ kind: 'retryable', code: 'SQLITE_BUSY', path: dbFile })
+      expect(listBackups(backups)).toEqual([])
+      db.close()
+      expect(versionOf(dbFile)).toBe(SCHEMA_VERSION - 1)
+    },
+    20_000,
+  )
+
+  it('keeps the version it read when a sidecar cannot be cleaned up (antivirus, an indexer)', async () => {
+    const { db, dbFile, backups } = await oneBehind()
+    db.close()
+    const rm = fs.rmSync
+    vi.spyOn(fs, 'rmSync').mockImplementation((p, opts) => {
+      if (String(p).endsWith('-shm')) throw coded('EPERM')
+      rm(p, opts)
+    })
+
+    const opened = openVaultDbWithRecovery(dbFile, backups)
+    vi.restoreAllMocks()
+    expect(opened.outcome).toEqual({ kind: 'ok' })
+    expect(listBackups(backups).map((b) => b.reason)).toEqual(['pre-migration'])
+    opened.db!.close()
+  })
+
+  it('covers a DB with tables and no version, which the legacy migration rebuilds', () => {
+    const sb = sandbox()
+    const backups = path.join(sb.dir, 'backups')
+    const legacy = new Database(sb.dbFile)
+    legacy.exec(`CREATE TABLE projects (id INTEGER PRIMARY KEY, slug TEXT);
+      CREATE TABLE sessions (id INTEGER PRIMARY KEY, project_id INTEGER);
+      CREATE TABLE messages (id INTEGER PRIMARY KEY, session_id INTEGER, body TEXT);
+      INSERT INTO messages (body) VALUES ('sole copy');`)
+    legacy.close()
+
+    const opened = openVaultDbWithRecovery(sb.dbFile, backups)
+    expect(opened.outcome).toEqual({ kind: 'ok' })
+    expect(count(opened.db!, 'messages')).toBe(0)
+    opened.db!.close()
+    const [pre] = listBackups(backups)
+    expect(pre.reason).toBe('pre-migration')
+    const copy = readOnly(path.join(backups, pre.name))
+    expect(count(copy, 'messages')).toBe(1)
+    copy.close()
+  })
+
+  it('needs no copy of a file with nothing in it', () => {
+    const sb = sandbox()
+    const backups = path.join(sb.dir, 'backups')
+    fs.writeFileSync(sb.dbFile, '')
+    const opened = openVaultDbWithRecovery(sb.dbFile, backups)
+    expect(opened.outcome).toEqual({ kind: 'ok' })
+    expect(readSchemaVersion(opened.db!)).toBe(SCHEMA_VERSION)
+    opened.db!.close()
+    expect(listBackups(backups)).toEqual([])
   })
 })
 
@@ -382,21 +711,18 @@ describe('quarantine', () => {
     expect(fs.readFileSync(dbFile).equals(garbage)).toBe(true)
   })
 
-  it('moves everything back when a sidecar will not move', async () => {
+  it('moves everything back when one file will not move', async () => {
     const { db, dbFile, backups } = await seeded()
     db.close()
     fs.writeFileSync(dbFile, 'garbage'.repeat(200))
+    fs.writeFileSync(`${dbFile}-wal`, 'the wal')
     const rename = fs.renameSync
     vi.spyOn(fs, 'renameSync').mockImplementation((from, to) => {
-      if (String(from) === `${dbFile}-wal`) throw coded('EBUSY')
+      if (String(from) === dbFile) throw coded('EBUSY')
       rename(from, to)
     })
 
-    // Written here because SQLite deletes a WAL it cannot use when a real open closes.
-    const opened = openVaultDbWithRecovery(dbFile, backups, new Date(), () => {
-      fs.writeFileSync(`${dbFile}-wal`, 'the wal')
-      throw coded('SQLITE_NOTADB')
-    })
+    const opened = openVaultDbWithRecovery(dbFile, backups)
     expect(opened.outcome).toMatchObject({ kind: 'retryable', code: 'EBUSY' })
     expect(fs.readFileSync(dbFile, 'utf8')).toMatch(/^garbage/)
     expect(fs.readFileSync(`${dbFile}-wal`, 'utf8')).toBe('the wal')
@@ -430,9 +756,7 @@ describe('quarantine', () => {
     const { db, dbFile, backups } = await seeded()
     db.close()
     fs.writeFileSync(dbFile, 'garbage'.repeat(200))
-    let calls = 0
-    const opened = openVaultDbWithRecovery(dbFile, backups, new Date(), (f) => {
-      if (calls++ === 0) return openVaultDb(f)
+    const opened = openVaultDbWithRecovery(dbFile, backups, new Date(), () => {
       throw coded('SQLITE_FULL')
     })
     expect(opened.db).toBeNull()

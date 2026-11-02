@@ -30,7 +30,13 @@ export function openVaultDb(dbFile: string, opts: { migrate?: boolean; busyTimeo
     // are lost, and the index rebuilds them from ~/.claude on the next scan.
     db.pragma('synchronous = NORMAL')
     db.pragma('foreign_keys = ON')
-    if (opts.migrate !== false) migrate(db)
+    if (opts.migrate !== false) {
+      // SQLite opens a file it may not write read-only without saying so, and on a current
+      // schema nothing below writes. The first INSERT must not be where that comes out. It
+      // takes a real write: on such a handle BEGIN IMMEDIATE only starts a read transaction.
+      db.exec('BEGIN IMMEDIATE; CREATE TABLE write_probe (x); ROLLBACK')
+      migrate(db)
+    }
     return db
   } catch (err) {
     // A corrupt file only surfaces once a statement runs. Close the handle so
@@ -259,7 +265,7 @@ const SCHEMA_SQL = `
   CREATE INDEX IF NOT EXISTS idx_message_tags_tag ON message_tags(tag_id);
 `
 
-function tableExists(db: DbHandle, name: string): boolean {
+export function tableExists(db: DbHandle, name: string): boolean {
   return Boolean(db.prepare(`SELECT 1 FROM sqlite_master WHERE name = ?`).get(name))
 }
 
