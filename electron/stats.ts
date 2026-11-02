@@ -40,7 +40,8 @@ function tokenize(text: string): string[] {
  * One row per API response. Claude Code writes a line per content block and repeats
  * `usage` on each (later lines carry the final, larger `output_tokens`), so summing
  * lines double-counts ~2×. Group by response identity and take each field's max;
- * lines without an id count on their own.
+ * lines without an id count once per `msg_key`, the same line in another session being
+ * the same usage.
  */
 const RESPONSES_SQL = `
   SELECT MAX(model) AS model,
@@ -51,10 +52,39 @@ const RESPONSES_SQL = `
          MAX(COALESCE(cache_creation_1h_tokens, 0)) AS cacheCreation1h
   FROM messages
   -- Every usage record carries input_tokens; matching the predicate of the partial
-  -- idx_messages_usage_cover lets SQLite answer from that covering index alone.
+  -- idx_messages_usage_cover lets SQLite read these from that index, and go to the row
+  -- only for the msg_key of a line with no id.
   WHERE input_tokens IS NOT NULL
   GROUP BY CASE WHEN api_msg_id IS NOT NULL THEN api_msg_id || ':' || COALESCE(request_id, '')
-                ELSE 'row:' || id END
+                ELSE 'key:' || msg_key END
+`
+
+/**
+ * A line can have several rows: a forked session copies earlier lines, and a rewritten file
+ * leaves them in an archived generation too. Stats count lines, so everything here counts
+ * distinct `msg_key`s, as `listPrompts` does. Prompts are read through their partial index;
+ * left to itself SQLite walks idx_messages_key and reads every row to find them (~730 ms on
+ * 750k rows, against ~10 ms).
+ */
+const PROMPTS = `messages INDEXED BY idx_messages_prompt`
+
+/**
+ * Role counts come from idx_messages_class_role, without reading ~700k wide rows for their
+ * `msg_key`; the rows of lines held more than once are then taken back off. Finding those
+ * needs only idx_messages_key.
+ */
+const ROLES_SQL = `
+  SELECT role, SUM(count) AS count FROM (
+    SELECT role, COUNT(*) AS count FROM messages WHERE message_class != 'meta' GROUP BY role
+    UNION ALL
+    SELECT m.role, COUNT(DISTINCT m.msg_key) - COUNT(*)
+    FROM (SELECT msg_key FROM messages GROUP BY msg_key HAVING COUNT(*) > 1) AS repeated
+    JOIN messages m ON m.msg_key = repeated.msg_key
+    WHERE m.message_class != 'meta'
+    GROUP BY m.role
+  )
+  GROUP BY role
+  ORDER BY count DESC, role
 `
 
 export function computeStats(db: DbHandle): StatsPayload {
@@ -66,20 +96,19 @@ export function computeStats(db: DbHandle): StatsPayload {
   const archivedPlans = (
     db.prepare(`SELECT COUNT(*) AS c FROM plan_files WHERE archived_at IS NOT NULL`).get() as { c: number }
   ).c
-  const totalMessages = (db.prepare(`SELECT COUNT(*) AS c FROM messages`).get() as { c: number }).c
-  const totalPrompts = (db.prepare(`SELECT COUNT(*) AS c FROM messages WHERE is_prompt = 1`).get() as { c: number }).c
+  const totalMessages = (db.prepare(`SELECT COUNT(DISTINCT msg_key) AS c FROM messages`).get() as { c: number }).c
+  const totalPrompts = (
+    db.prepare(`SELECT COUNT(DISTINCT msg_key) AS c FROM ${PROMPTS} WHERE is_prompt = 1`).get() as { c: number }
+  ).c
 
-  const messagesByRole = db
-    .prepare(
-      `SELECT role, COUNT(*) AS count FROM messages WHERE message_class != 'meta'
-       GROUP BY role ORDER BY count DESC`,
-    )
-    .all() as { role: string; count: number }[]
+  const messagesByRole = db.prepare(ROLES_SQL).all() as { role: string; count: number }[]
 
   // What *I* keep asking about: count the prompts a word appears in, not its raw
   // occurrences — one pasted log would otherwise outweigh weeks of real questions.
   const freq = new Map<string, number>()
-  for (const { body } of db.prepare(`SELECT prompt_text AS body FROM messages WHERE is_prompt = 1`).iterate() as Iterable<{
+  for (const { body } of db
+    .prepare(`SELECT prompt_text AS body FROM ${PROMPTS} WHERE is_prompt = 1 GROUP BY msg_key`)
+    .iterate() as Iterable<{
     body: string
   }>) {
     for (const t of new Set(tokenize(body))) freq.set(t, (freq.get(t) ?? 0) + 1)
@@ -122,8 +151,8 @@ export function computeStats(db: DbHandle): StatsPayload {
   const activityByDay = activityFromTimestamps
     ? (db
         .prepare(
-          `SELECT strftime('%Y-%m-%d', datetime(ts_ms / 1000, 'unixepoch', 'localtime')) AS day, COUNT(*) AS count
-           FROM messages
+          `SELECT strftime('%Y-%m-%d', datetime(ts_ms / 1000, 'unixepoch', 'localtime')) AS day, COUNT(DISTINCT msg_key) AS count
+           FROM ${PROMPTS}
            WHERE is_prompt = 1 AND ts_ms IS NOT NULL
            GROUP BY day
            ORDER BY day DESC

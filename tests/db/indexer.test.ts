@@ -476,6 +476,44 @@ describe('stats', () => {
     expect(m.cacheCreation1h).toBe(40)
     expect(stats.totalPrompts).toBe(1)
   })
+
+  it('counts a line once when a rewrite keeps it in an archived generation', async () => {
+    const sb = sandbox()
+    const db = sb.open()
+    const pid = sb.project(db)
+    const file = path.join(sb.projectRoot, 's.jsonl')
+    const index = () => indexSessionFile(db, { projectId: pid, projectRoot: sb.projectRoot, filePath: file })
+    // A usage line with no response id counts by the line, so it needs the same care.
+    const noId = JSON.stringify({
+      type: 'assistant',
+      uuid: 'a2',
+      message: { role: 'assistant', model: 'claude-opus-5-5', content: [{ type: 'text', text: 'no id' }], usage: { input_tokens: 4, output_tokens: 1 } },
+    })
+    const meta = JSON.stringify({ type: 'ai-title', uuid: 't1', aiTitle: 'a title' })
+    const lines = [userLine('u1', 'first question here'), assistantLine('a1', 'an answer'), noId, meta]
+    writeLines(file, lines)
+    await index()
+    const before = computeStats(db)
+    expect(before.totalMessages).toBe(4)
+    expect(before.totalPrompts).toBe(1)
+    expect(before.activityByDay.map((d) => d.count)).toEqual([1])
+
+    writeLines(file, [userLine('n1', 'prepended question'), ...lines])
+    await index()
+    const after = computeStats(db)
+    expect(after.archivedSessions).toBe(1)
+    expect(after.totalMessages).toBe(5)
+    expect(after.totalPrompts).toBe(2)
+    expect(after.activityByDay.map((d) => d.count)).toEqual([2])
+    expect(after.topTokens.find((t) => t.token === 'first')?.count).toBe(1)
+    expect(after.messagesByRole).toEqual([
+      { role: 'assistant', count: 2 },
+      { role: 'user', count: 2 },
+    ])
+    expect(after.tokensByModel).toEqual(before.tokensByModel)
+    // The Prompts tab counts the same way.
+    expect(listPrompts(db, { sort: 'recent', query: 'first question' })[0].uses).toBe(1)
+  })
 })
 
 describe('search', () => {
