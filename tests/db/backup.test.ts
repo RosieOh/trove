@@ -268,6 +268,9 @@ describe('an open that fails for any other reason swaps nothing', () => {
     snapshot(db, backups, 'daily', new Date(Date.UTC(2026, 9, 1)))
     // One schema behind, so opening has to write: a current DB would open without the lock.
     db.prepare(`UPDATE meta SET value = ? WHERE key = 'schema_version'`).run(String(SCHEMA_VERSION - 1))
+    // No pre-migration copy: this is about the open, and Windows may refuse to copy a file
+    // this connection holds open.
+    setSetting(db, 'backupKeep', '0')
     db.exec('BEGIN IMMEDIATE')
 
     const opened = openVaultDbWithRecovery(dbFile, backups, new Date(), (f) => openVaultDb(f, { busyTimeoutMs: 50 }))
