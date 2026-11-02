@@ -84,6 +84,88 @@ describe('plans follow archive mode', () => {
   })
 })
 
+describe('a plan file that comes back never replaces an archived body', () => {
+  const later = () => new Date(Date.now() + 5000)
+  const bodies = (db: DbHandle) =>
+    db.prepare(`SELECT file_path AS file, body, archived_at IS NOT NULL AS archived FROM plan_files ORDER BY id`).all() as {
+      file: string
+      body: string
+      archived: number
+    }[]
+
+  function archived() {
+    const ctx = withPlans()
+    fullReindexPlans(ctx.db, ctx.plansRoot, 'keep')
+    const original = fs.readFileSync(ctx.plan, 'utf8')
+    fs.rmSync(ctx.plan)
+    fullReindexPlans(ctx.db, ctx.plansRoot, 'keep')
+    return { ...ctx, original }
+  }
+
+  it.each(['keep', 'mirror'] as const)('keeps it next to the new plan (%s)', (mode) => {
+    const { db, plansRoot, plan, original } = archived()
+    fs.writeFileSync(plan, '# Rollout\n\nA different plan with the wombatmarker.\n')
+    fs.utimesSync(plan, later(), later())
+    indexPlanSinglePath(db, plansRoot, plan, mode)
+
+    const [old, current] = bodies(db)
+    expect(old).toMatchObject({ body: original, archived: 1 })
+    expect(old.file).toMatch(/rollout\.md#archived-\d+$/)
+    expect(current).toEqual({ file: plan, body: '# Rollout\n\nA different plan with the wombatmarker.\n', archived: 0 })
+    expect(search(db)).toMatchObject([{ hitType: 'plan', archived: true }])
+    expect(unifiedSearch(db, { query: 'wombatmarker', scope: 'plans', limit: 10 })).toMatchObject([{ archived: false }])
+    db.exec(`INSERT INTO plan_files_fts(plan_files_fts) VALUES('integrity-check')`)
+
+    // The next scan leaves both alone, and the purge removes only the archived one.
+    fullReindexPlans(db, plansRoot, mode)
+    expect(bodies(db)).toHaveLength(2)
+    expect(purgeArchived(db)).toBe(1)
+    expect(bodies(db).map((r) => r.file)).toEqual([plan])
+  })
+
+  it('treats different content as a different plan even at the same mtime', () => {
+    const { db, plansRoot, plan, original } = (() => {
+      const ctx = withPlans()
+      fullReindexPlans(ctx.db, ctx.plansRoot, 'keep')
+      const body = fs.readFileSync(ctx.plan, 'utf8')
+      const { mtime } = fs.statSync(ctx.plan)
+      fs.rmSync(ctx.plan)
+      fullReindexPlans(ctx.db, ctx.plansRoot, 'keep')
+      fs.writeFileSync(ctx.plan, '# Same mtime, other words\n')
+      fs.utimesSync(ctx.plan, mtime, mtime)
+      return { ...ctx, original: body }
+    })()
+    indexPlanSinglePath(db, plansRoot, plan, 'keep')
+    expect(bodies(db)).toMatchObject([{ body: original, archived: 1 }, { file: plan, archived: 0 }])
+  })
+
+  it('un-archives in place when the content is the same, whatever the mtime', () => {
+    const { db, plansRoot, plan, original } = archived()
+    const { id } = db.prepare(`SELECT id FROM plan_files`).get() as { id: number }
+    fs.writeFileSync(plan, original)
+    fs.utimesSync(plan, later(), later())
+    indexPlanSinglePath(db, plansRoot, plan, 'keep')
+    expect(bodies(db)).toEqual([{ file: plan, body: original, archived: 0 }])
+    expect(db.prepare(`SELECT id FROM plan_files`).get()).toEqual({ id })
+  })
+
+  it('still replaces the body of a live plan that was edited', () => {
+    const { db, plansRoot, plan } = withPlans()
+    fullReindexPlans(db, plansRoot, 'keep')
+    fs.writeFileSync(plan, '# Rollout\n\nEdited.\n')
+    fs.utimesSync(plan, later(), later())
+    indexPlanSinglePath(db, plansRoot, plan, 'keep')
+    expect(bodies(db)).toEqual([{ file: plan, body: '# Rollout\n\nEdited.\n', archived: 0 }])
+  })
+
+  it('mirror mode leaves an archived plan alone, from a scan or a deletion event', () => {
+    const { db, plansRoot, plan, original } = archived()
+    fullReindexPlans(db, plansRoot, 'mirror')
+    indexPlanSinglePath(db, plansRoot, plan, 'mirror')
+    expect(bodies(db)).toEqual([{ file: plan, body: original, archived: 1 }])
+  })
+})
+
 describe('schema v9 → v10', () => {
   it('adds plan_files.archived_at in place, after a pre-migration copy', () => {
     const { db, dbFile, dir, plansRoot } = withPlans()
