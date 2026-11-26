@@ -77,11 +77,13 @@ describe('MCP JSON-RPC handling', () => {
 describe('MCP server paths and launch command', () => {
   it('defaults to the Trove userData folder on each platform', () => {
     expect(defaultDbPath('darwin', {}, '/Users/me')).toBe('/Users/me/Library/Application Support/Trove/vault.db')
-    expect(defaultDbPath('linux', {}, '/home/me')).toBe(path.join('/home/me', '.config', 'Trove', 'vault.db'))
-    expect(defaultDbPath('linux', { XDG_CONFIG_HOME: '/xdg' }, '/home/me')).toBe(path.join('/xdg', 'Trove', 'vault.db'))
+    // Paths follow the target platform's rules whatever OS runs the test (CI runs all three).
+    expect(defaultDbPath('linux', {}, '/home/me')).toBe('/home/me/.config/Trove/vault.db')
+    expect(defaultDbPath('linux', { XDG_CONFIG_HOME: '/xdg' }, '/home/me')).toBe('/xdg/Trove/vault.db')
     expect(defaultDbPath('win32', { APPDATA: 'C:\\Users\\me\\AppData\\Roaming' }, 'C:\\Users\\me')).toBe(
-      path.join('C:\\Users\\me\\AppData\\Roaming', 'Trove', 'vault.db'),
+      'C:\\Users\\me\\AppData\\Roaming\\Trove\\vault.db',
     )
+    expect(defaultDbPath('win32', {}, 'C:\\Users\\me')).toBe('C:\\Users\\me\\AppData\\Roaming\\Trove\\vault.db')
   })
 
   it('takes --db over TROVE_DB over the default', () => {
@@ -104,6 +106,17 @@ describe('MCP server paths and launch command', () => {
     expect(l.claudeAddLine).toBe(
       "claude mcp add trove --scope user --env ELECTRON_RUN_AS_NODE=1 -- /Applications/Trove.app/Contents/MacOS/Trove /Applications/Trove.app/Contents/Resources/app.asar/dist-electron/mcpServer.cjs --db '/Users/me/Library/Application Support/Trove/vault.db'",
     )
+  })
+
+  it('builds Windows paths with backslashes on any host', () => {
+    const l = mcpLaunch({
+      packaged: true,
+      execPath: 'C:\\Program Files\\Trove\\Trove.exe',
+      appPath: 'C:\\Program Files\\Trove\\resources\\app.asar',
+      dbFile: 'C:\\Users\\me\\AppData\\Roaming\\Trove\\vault.db',
+      platform: 'win32',
+    })
+    expect(l.args[0]).toBe('C:\\Program Files\\Trove\\resources\\app.asar\\dist-electron\\mcpServer.cjs')
   })
 
   it('uses node and the repo build in development', () => {

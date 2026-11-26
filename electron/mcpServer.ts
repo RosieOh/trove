@@ -518,19 +518,23 @@ export function handleRequest(
 
 // ── Process entry ───────────────────────────────────────────────────────────
 
+/** Path rules of the platform a path is for, not of the one this code runs on. */
+const pathFor = (platform: NodeJS.Platform) => (platform === 'win32' ? path.win32 : path.posix)
+
 /** Where the app keeps `vault.db` (Electron's userData for the "Trove" product name). */
 export function defaultDbPath(
   platform: NodeJS.Platform = process.platform,
   env: NodeJS.ProcessEnv = process.env,
   home: string = os.homedir(),
 ): string {
+  const p = pathFor(platform)
   const appData =
     platform === 'darwin'
-      ? path.join(home, 'Library', 'Application Support')
+      ? p.join(home, 'Library', 'Application Support')
       : platform === 'win32'
-        ? env.APPDATA || path.join(home, 'AppData', 'Roaming')
-        : env.XDG_CONFIG_HOME || path.join(home, '.config')
-  return path.join(appData, 'Trove', 'vault.db')
+        ? env.APPDATA || p.join(home, 'AppData', 'Roaming')
+        : env.XDG_CONFIG_HOME || p.join(home, '.config')
+  return p.join(appData, 'Trove', 'vault.db')
 }
 
 /** `--db <path>` / `--db=<path>`, then `TROVE_DB`, then the app's default location. */
@@ -560,7 +564,7 @@ export function mcpLaunch(opts: {
   platform?: NodeJS.Platform
 }): McpLaunch {
   const platform = opts.platform ?? process.platform
-  const script = path.join(opts.appPath, 'dist-electron', 'mcpServer.cjs')
+  const script = pathFor(platform).join(opts.appPath, 'dist-electron', 'mcpServer.cjs')
   // Packaged: the app binary is a Node runtime with ELECTRON_RUN_AS_NODE, and reads
   // the script (and better-sqlite3's unpacked .node) through app.asar.
   const command = opts.packaged ? opts.execPath : 'node'
