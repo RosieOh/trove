@@ -1,7 +1,10 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import Fuse from 'fuse.js'
 import type {
+  ArchiveNews,
   FavoriteRow,
+  SessionListRow,
+  SearchFilters,
   IndexProgress,
   UpdateStatus,
   MatchMode,
@@ -47,10 +50,13 @@ import { PromptsTab } from './tabs/PromptsTab'
 import { SettingsTab } from './tabs/SettingsTab'
 import { FavoritesTab } from './tabs/FavoritesTab'
 import { ExportTab } from './tabs/ExportTab'
+import { SessionsTab } from './tabs/SessionsTab'
+import { isValidRegex, parseSearchQuery } from '../shared/searchSyntax'
 
 /** Main rail, top to bottom. Settings and the theme switch sit in the rail footer. */
 const RAIL: { key: Tab; labelKey: MessageKey; icon: RailItem<Tab>['icon'] }[] = [
   { key: 'search', labelKey: 'nav.search', icon: 'search' },
+  { key: 'sessions', labelKey: 'nav.sessions', icon: 'sessions' },
   { key: 'prompts', labelKey: 'nav.prompts', icon: 'prompt' },
   { key: 'files', labelKey: 'nav.files', icon: 'file' },
   { key: 'favorites', labelKey: 'nav.favorites', icon: 'star' },
@@ -60,6 +66,7 @@ const RAIL: { key: Tab; labelKey: MessageKey; icon: RailItem<Tab>['icon'] }[] = 
 ]
 
 const PAGE_SUB: Record<Exclude<Tab, 'search'>, MessageKey> = {
+  sessions: 'page.sessions.sub',
   prompts: 'prompts.subtitle',
   files: 'page.files.sub',
   favorites: 'page.favorites.sub',
@@ -67,6 +74,38 @@ const PAGE_SUB: Record<Exclude<Tab, 'search'>, MessageKey> = {
   stats: 'page.stats.sub',
   export: 'page.export.sub',
   settings: 'page.settings.sub',
+}
+
+/** Results per search request; "더 보기" asks for the next page. */
+const SEARCH_PAGE = 120
+
+/** Drops one `key:value` operator (quoted or not) from a query. */
+function withoutOperator(q: string, key: string, value: string): string {
+  const esc = (x: string) => x.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  const re = new RegExp(`(^|\\s)${esc(key)}:(?:"${esc(value)}"|${esc(value)})(?=\\s|$)`, 'i')
+  return q.replace(re, ' ').replace(/\s+/g, ' ').trim()
+}
+
+/** `YYYY-MM-DD` of `days` ago, local time. */
+function daysAgo(days: number): string {
+  const d = new Date(Date.now() - days * 86_400_000)
+  const p = (n: number) => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`
+}
+
+/** Keeps each session's hits together, in the order the sessions first appear. */
+function groupBySession(hits: UnifiedSearchHit[]): UnifiedSearchHit[] {
+  const order: string[] = []
+  const groups = new Map<string, UnifiedSearchHit[]>()
+  for (const h of hits) {
+    const key = isPlanHit(h) ? `plan:${h.planId}` : `s:${h.sessionId}`
+    if (!groups.has(key)) {
+      groups.set(key, [])
+      order.push(key)
+    }
+    groups.get(key)!.push(h)
+  }
+  return order.flatMap((k) => groups.get(k)!)
 }
 
 /** Fuzzy re-ranking may only reorder the FTS results, never drop one. */
@@ -116,6 +155,12 @@ export default function App() {
   const [update, setUpdate] = useState<UpdateStatus>({ state: 'idle' })
   const [paletteOpen, setPaletteOpen] = useState(false)
   const [inspectorOpen, setInspectorOpen] = useState(true)
+  const [grouped, setGrouped] = useState(false)
+  /** More results may exist past the current page (the last page came back full). */
+  const [hasMore, setHasMore] = useState(false)
+  const [loadingMore, setLoadingMore] = useState(false)
+  const [archiveNews, setArchiveNews] = useState<ArchiveNews | null>(null)
+  const [paletteSessions, setPaletteSessions] = useState<SessionListRow[]>([])
   const searchInputRef = useRef<HTMLInputElement | null>(null)
   const [activeResult, setActiveResult] = useState(-1)
   // public/theme-init.js applied the saved (or OS) theme before first paint.
@@ -138,6 +183,7 @@ export default function App() {
     matchMode,
     sortMode,
     dateRange,
+    shown: 0,
   })
   searchParamsRef.current = {
     query,
@@ -151,6 +197,7 @@ export default function App() {
     matchMode,
     sortMode,
     dateRange,
+    shown: hits.length,
   }
 
   const loadProjects = useCallback(async () => {
@@ -166,45 +213,101 @@ export default function App() {
     setRecentPlans(await window.vault.plansList())
   }, [])
 
+  /** Inline operators (`project:`, `branch:`, `/regex/`…) typed into the search box. */
+  const parsed = useMemo(() => parseSearchQuery(query), [query])
+  const regexError = parsed.regex != null && !isValidRegex(parsed.regex, parsed.regexFlags)
+
+  /** Panel filters plus typed operators; an operator wins over the panel for the same field. */
+  const buildFilters = useCallback(
+    (p: typeof searchParamsRef.current): SearchFilters | null => {
+      const q = parseSearchQuery(p.query)
+      const tagFromQuery = q.tag ? tags.find((x) => x.name.toLowerCase() === q.tag!.toLowerCase())?.id : undefined
+      const tagId = tagFromQuery ?? p.tagFilter
+      const hasRegex = q.regex != null && isValidRegex(q.regex, q.regexFlags)
+      if (!q.text && !hasRegex && tagId == null) return null
+      return {
+        query: q.text,
+        projectId: p.projectId,
+        projectQuery: q.project,
+        branch: q.branch,
+        archived: q.archived,
+        role: q.role ?? p.role,
+        limit: SEARCH_PAGE,
+        excludeMeta: p.excludeMeta,
+        excludeSubagents: p.excludeSubagents,
+        excludeTools: p.excludeTools,
+        tagId,
+        scope: p.searchScope,
+        matchMode: p.matchMode,
+        sort: p.sortMode,
+        sinceMs: q.sinceMs ?? sinceMsFor(p.dateRange),
+        untilMs: q.untilMs,
+        regex: hasRegex ? q.regex : undefined,
+        regexFlags: hasRegex ? q.regexFlags : undefined,
+      }
+    },
+    [tags],
+  )
+
+  const pageFull = (list: UnifiedSearchHit[]) =>
+    list.filter(isMessageHit).length >= SEARCH_PAGE || list.filter(isPlanHit).length >= SEARCH_PAGE
+
   const runSearch = useCallback(async () => {
     const seq = ++searchSeq.current
-    if (!query.trim() && tagFilter == null) {
+    const filters = buildFilters(searchParamsRef.current)
+    if (!filters) {
       setHits([])
+      setHasMore(false)
       setLoading(false)
       return
     }
     setLoading(true)
     try {
-      const raw = await window.vault.search({
-        query,
-        projectId,
-        role,
-        limit: 120,
-        excludeMeta,
-        excludeSubagents,
-        excludeTools,
-        tagId: tagFilter,
-        scope: searchScope,
-        matchMode,
-        sort: sortMode,
-        sinceMs: sinceMsFor(dateRange),
-      })
+      const raw = await window.vault.search(filters)
       // Only the newest request may touch the list; older ones may resolve later or as
       // `null` (superseded while queued behind a slow search).
-      if (seq === searchSeq.current && raw) setHits(raw)
+      if (seq === searchSeq.current && raw) {
+        setHits(raw)
+        setHasMore(pageFull(raw))
+      }
     } finally {
       if (seq === searchSeq.current) setLoading(false)
     }
-  }, [query, projectId, role, excludeMeta, excludeSubagents, excludeTools, tagFilter, searchScope, matchMode, sortMode, dateRange])
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [query, projectId, role, excludeMeta, excludeSubagents, excludeTools, tagFilter, searchScope, matchMode, sortMode, dateRange, buildFilters])
+
+  const loadMoreHits = async () => {
+    const filters = buildFilters(searchParamsRef.current)
+    if (!filters || loadingMore) return
+    const seq = searchSeq.current
+    setLoadingMore(true)
+    try {
+      const raw = await window.vault.search({
+        ...filters,
+        offset: hits.filter(isMessageHit).length,
+        planOffset: hits.filter(isPlanHit).length,
+      })
+      if (seq !== searchSeq.current || !raw) return
+      setHits((prev) => {
+        const seen = new Set(prev.map((h) => (isPlanHit(h) ? `p${h.planId}` : `m${h.messageId}`)))
+        return [...prev, ...raw.filter((h) => !seen.has(isPlanHit(h) ? `p${h.planId}` : `m${h.messageId}`))]
+      })
+      setHasMore(pageFull(raw))
+    } finally {
+      setLoadingMore(false)
+    }
+  }
 
   // Fuse only refines relevance order; a time sort must stay a time sort.
   const fuzzyHits = useMemo(() => {
-    const q = query.trim()
-    if (!q || hits.length === 0 || sortMode !== 'relevance') return hits
-    if (hits.every(isPlanHit)) return fuzzyReorder(hits, ['title', 'snippet', 'filePath'], q)
-    if (!hits.every(isMessageHit)) return hits
-    return fuzzyReorder(hits, ['body', 'snippet', 'projectSlug', 'projectName'], q)
-  }, [hits, query, sortMode])
+    const q = parsed.text
+    let out = hits
+    if (q && hits.length > 0 && sortMode === 'relevance' && parsed.regex == null) {
+      if (hits.every(isPlanHit)) out = fuzzyReorder(hits, ['title', 'snippet', 'filePath'], q)
+      else if (hits.every(isMessageHit)) out = fuzzyReorder(hits, ['body', 'snippet', 'projectSlug', 'projectName'], q)
+    }
+    return grouped ? groupBySession(out) : out
+  }, [hits, parsed, sortMode, grouped])
 
   useEffect(() => {
     void loadProjects()
@@ -228,6 +331,28 @@ export default function App() {
       if ((e.metaKey || e.ctrlKey) && (e.key === 'k' || e.key === 'K')) {
         e.preventDefault()
         setPaletteOpen((v) => !v)
+        return
+      }
+      if (document.querySelector('[role="dialog"]')) return
+      // ⌘1…⌘8 follow the rail; ⌘, opens Settings as in most Mac apps.
+      if ((e.metaKey || e.ctrlKey) && !e.shiftKey && !e.altKey) {
+        const n = Number(e.key)
+        if (n >= 1 && n <= RAIL.length) {
+          e.preventDefault()
+          setTab(RAIL[n - 1].key)
+          return
+        }
+        if (e.key === ',') {
+          e.preventDefault()
+          setTab('settings')
+          return
+        }
+      }
+      const tag = (e.target as HTMLElement | null)?.tagName
+      if (e.key === '/' && tag !== 'INPUT' && tag !== 'TEXTAREA' && tag !== 'SELECT') {
+        e.preventDefault()
+        setTab('search')
+        setTimeout(() => searchInputRef.current?.focus(), 0)
       }
     }
     window.addEventListener('keydown', onKey)
@@ -299,6 +424,7 @@ export default function App() {
     const tabCmds: Command[] = (
       [
         ['search', 'nav.search'],
+        ['sessions', 'nav.sessions'],
         ['prompts', 'nav.prompts'],
         ['files', 'nav.files'],
         ['favorites', 'nav.favorites'],
@@ -342,8 +468,20 @@ export default function App() {
         setTab('search')
       },
     }))
-    return [...tabCmds, ...actions, ...projCmds]
-  }, [projects, t])
+    const sessionCmds: Command[] = paletteSessions.map((s) => ({
+      id: `session:${s.sessionId}`,
+      label: t('palette.session', { label: s.title || s.preview || s.sessionFile }),
+      hint: sidebarPrimaryLabel(s.projectName),
+      run: () =>
+        setTranscriptOpen({ sessionId: s.sessionId, sessionFile: s.sessionFile, projectLabel: s.projectName, highlightLine: -1 }),
+    }))
+    return [...tabCmds, ...actions, ...sessionCmds, ...projCmds]
+  }, [projects, paletteSessions, t])
+
+  useEffect(() => {
+    if (!paletteOpen) return
+    void window.vault.sessionsList({ limit: 30 }).then((r) => setPaletteSessions(r.rows))
+  }, [paletteOpen])
 
   useEffect(() => {
     const off = window.vault.onIndexUpdated(() => {
@@ -352,31 +490,38 @@ export default function App() {
       void loadRecentPlans()
       setRefreshKey((k) => k + 1)
       void (async () => {
-        const p = searchParamsRef.current
         const seq = ++searchSeq.current
-        if (!p.query.trim() && p.tagFilter == null) {
+        const filters = buildFilters(searchParamsRef.current)
+        if (!filters) {
           setHits([])
           return
         }
-        const raw = await window.vault.search({
-          query: p.query,
-          projectId: p.projectId,
-          role: p.role,
-          limit: 120,
-          excludeMeta: p.excludeMeta,
-          excludeSubagents: p.excludeSubagents,
-          excludeTools: p.excludeTools,
-          tagId: p.tagFilter,
-          scope: p.searchScope,
-          matchMode: p.matchMode,
-          sort: p.sortMode,
-          sinceMs: sinceMsFor(p.dateRange),
-        })
+        // Refresh what is on screen, not just the first page.
+        const shown = searchParamsRef.current.shown
+        const raw = await window.vault.search({ ...filters, limit: Math.min(200, Math.max(SEARCH_PAGE, shown)) })
         if (seq === searchSeq.current && raw) setHits(raw)
       })()
     })
     return off
-  }, [loadProjects, loadRecentSessions, loadRecentPlans])
+  }, [loadProjects, loadRecentSessions, loadRecentPlans, buildFilters])
+
+  useEffect(() => {
+    const offFocus = window.vault.onFocusSearch(() => {
+      setTab('search')
+      setTimeout(() => {
+        searchInputRef.current?.focus()
+        searchInputRef.current?.select()
+      }, 0)
+    })
+    const offNews = window.vault.onArchiveNews((n) => {
+      setArchiveNews(n)
+      setStatus(t('toast.archivedNews', { count: n.newlyArchived }))
+    })
+    return () => {
+      offFocus()
+      offNews()
+    }
+  }, [t])
 
   useEffect(() => {
     const t = setTimeout(() => {
@@ -602,9 +747,31 @@ export default function App() {
           {searching && (
             <div className="flex min-h-[2rem] flex-wrap items-center gap-2 text-[13px] text-ink-3">
               <span className="tabular">
-                {t('search.resultCount', { count: fuzzyHits.length })}
+                {t(hasMore ? 'search.resultCountMore' : 'search.resultCount', { count: fuzzyHits.length })}
                 {loading ? t('search.searching') : ''}
               </span>
+              {parsed.operators.map((o) => (
+                <button
+                  key={`${o.key}:${o.value}`}
+                  type="button"
+                  className="badge tone-violet mono"
+                  title={t('search.operator.remove')}
+                  onClick={() => setQuery((q) => withoutOperator(q, o.key, o.value))}
+                >
+                  {o.key}:{o.value} ×
+                </button>
+              ))}
+              {parsed.regex != null && (
+                <span className={`badge mono ${regexError ? 'tone-rose' : 'tone-violet'}`} title={regexError ? t('search.regexInvalid') : undefined}>
+                  {regexError ? t('search.regexInvalid') : t('search.regexMode')}
+                </span>
+              )}
+              {searchScope !== 'plans' && (
+                <label className="flex cursor-pointer items-center gap-1.5">
+                  <input type="checkbox" className="check" checked={grouped} onChange={(e) => setGrouped(e.target.checked)} />
+                  {t('search.groupBySession')}
+                </label>
+              )}
               {tagFilter != null && (
                 <button
                   type="button"
@@ -719,8 +886,12 @@ export default function App() {
 
           {searching && fuzzyHits.length > 0 && (
             <div className="list glass" aria-busy={loading}>
-              {fuzzyHits.map((h, i) =>
-                isPlanHit(h) ? (
+              {fuzzyHits.map((h, i) => {
+                const prev = i > 0 ? fuzzyHits[i - 1] : null
+                const newGroup =
+                  grouped && isMessageHit(h) && (!prev || !isMessageHit(prev) || prev.sessionId !== h.sessionId)
+                const groupSize = newGroup ? fuzzyHits.filter((x) => isMessageHit(x) && x.sessionId === h.sessionId).length : 0
+                const card = isPlanHit(h) ? (
                   <PlanSearchHitCard key={`plan-${h.planId}`} h={h} active={i === activeResult} onStatus={setStatus} />
                 ) : (
                   <article
@@ -764,8 +935,8 @@ export default function App() {
                               type="button"
                               className={GHOST_BTN}
                               onClick={async () => {
-                                await window.vault.copyText(await fullBody(h))
-                                setStatus(t('toast.copied'))
+                                const masked = await window.vault.copyText(await fullBody(h))
+                                setStatus(masked > 0 ? t('toast.copiedMasked', { count: masked }) : t('toast.copied'))
                               }}
                             >
                               {t('action.copy')}
@@ -800,9 +971,78 @@ export default function App() {
                       </div>
                     </div>
                   </article>
-                ),
-              )}
+                )
+                if (!newGroup || !isMessageHit(h)) return card
+                return (
+                  <Fragment key={`g-${h.sessionId}-${h.messageId}`}>
+                    <button
+                      type="button"
+                      className="flex items-baseline gap-2 px-3.5 pb-1 pt-3 text-left text-[12.5px] text-ink-3 hover:text-ink-1"
+                      onClick={() =>
+                        setTranscriptOpen({
+                          sessionId: h.sessionId,
+                          sessionFile: h.sessionFile,
+                          projectLabel: h.projectName || h.projectSlug,
+                          highlightLine: -1,
+                        })
+                      }
+                    >
+                      <span className="font-semibold text-ink-2">{sidebarPrimaryLabel(h.projectName || h.projectSlug)}</span>
+                      <span className="mono truncate">{h.sessionFile}</span>
+                      <span className="ml-auto shrink-0 tabular">{t('search.groupCount', { count: groupSize })}</span>
+                    </button>
+                    {card}
+                  </Fragment>
+                )
+              })}
             </div>
+          )}
+
+          {searching && hasMore && fuzzyHits.length > 0 && (
+            <div className="pb-4 text-center">
+              <button type="button" className="btn btn-tertiary" disabled={loadingMore} onClick={() => void loadMoreHits()}>
+                {loadingMore ? t('common.loading') : t('search.loadMore')}
+              </button>
+            </div>
+          )}
+
+          {!searching && (
+            <section className="section">
+              <div className="section-head">
+                <h2 className="section-title">{t('search.syntax.title')}</h2>
+                <span className="section-desc">{t('search.syntax.desc')}</span>
+              </div>
+              <div className="flex flex-wrap gap-1.5">
+                {[
+                  'role:me',
+                  'is:archived',
+                  `after:${daysAgo(7)}`,
+                  'branch:main',
+                  ...(projectId == null && projects[0] ? [`project:${sidebarPrimaryLabel(projects[0].displayName).split('/').pop()}`] : []),
+                  '/error|exception/i',
+                ].map((ex) => (
+                  <button
+                    key={ex}
+                    type="button"
+                    className="badge tone-violet mono"
+                    onClick={() => {
+                      setQuery((q) => (ex.startsWith('/') ? ex : `${q.trim()} ${ex} `.trimStart()))
+                      // Caret at the end, so what is typed next follows the operator.
+                      setTimeout(() => {
+                        const el = searchInputRef.current
+                        if (!el) return
+                        el.focus()
+                        el.setSelectionRange(el.value.length, el.value.length)
+                      }, 0)
+                    }}
+                  >
+                    {ex}
+                  </button>
+                ))}
+              </div>
+              <p className="text-[12.5px] leading-relaxed text-ink-3">{t('search.syntaxHint')}</p>
+              <p className="text-[12.5px] leading-relaxed text-ink-3">{t('search.keysHint')}</p>
+            </section>
           )}
         </div>
 
@@ -1010,6 +1250,17 @@ export default function App() {
         <PageHeader title={t(tab === 'search' ? 'nav.search' : RAIL.find((r) => r.key === tab)?.labelKey ?? 'nav.settings')} sub={pageSub} right={headerRight} />
         <main className="main">
           {tab === 'search' && searchView}
+          {tab === 'sessions' && (
+            <SessionsTab
+              projects={projects}
+              projectId={projectId}
+              onProjectChange={setProjectId}
+              onOpenSession={setTranscriptOpen}
+              onStatus={setStatus}
+              refreshKey={refreshKey}
+              archiveNews={archiveNews}
+            />
+          )}
           {tab === 'prompts' && (
             <PromptsTab
               projects={projects}
@@ -1062,7 +1313,9 @@ export default function App() {
       </div>
 
       <Toast message={status} onDone={clearStatus} />
-      {transcriptOpen && <SessionTranscriptModal open={transcriptOpen} onClose={() => setTranscriptOpen(null)} />}
+      {transcriptOpen && (
+        <SessionTranscriptModal open={transcriptOpen} onClose={() => setTranscriptOpen(null)} onStatus={setStatus} />
+      )}
       {planPreview && <PlanMarkdownModal open={planPreview} onClose={() => setPlanPreview(null)} />}
       {paletteOpen && <CommandPalette commands={commands} onClose={() => setPaletteOpen(false)} />}
     </div>

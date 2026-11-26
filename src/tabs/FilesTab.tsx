@@ -1,9 +1,37 @@
 import { useEffect, useState } from 'react'
 import type { FileRow, FileTouchRow } from '../../shared/ipc'
+import { parseToolEdits, type ToolEdit } from '../../shared/toolDiff'
+import { DiffView } from '../components/DiffView'
 import { useI18n } from '../i18n'
 import { Icon, RoleBadge, sidebarPrimaryLabel } from '../ui'
 import { formatTs } from '../format'
 import type { TranscriptOpen } from '../types'
+
+/** The change one tool call made to this file, fetched on demand (bodies can be large). */
+function TouchDiff({ messageId, path }: { messageId: number; path: string }) {
+  const { t } = useI18n()
+  const [edits, setEdits] = useState<ToolEdit[] | null>(null)
+  useEffect(() => {
+    let cancelled = false
+    void window.vault.messageBody(messageId).then((body) => {
+      if (!cancelled) setEdits(parseToolEdits(body))
+    })
+    return () => {
+      cancelled = true
+    }
+  }, [messageId])
+  if (!edits) return <p className="mt-2 text-[12.5px] text-ink-3">{t('common.loading')}</p>
+  const mine = edits.filter((e) => e.filePath === path)
+  if (!mine.length) return <p className="mt-2 text-[12.5px] text-ink-3">{t('diff.none')}</p>
+  return (
+    <div className="mt-2">
+      <DiffView edits={mine} />
+    </div>
+  )
+}
+
+/** Tool calls that change a file, as opposed to reading it. */
+const EDITING = /^\[도구\] (Edit|MultiEdit|Write|NotebookEdit)\b/m
 
 /**
  * File reverse-index. A file is normally buried inside a tool payload, so full-text
@@ -17,6 +45,8 @@ export function FilesTab({ onOpenSession }: { onOpenSession: (o: TranscriptOpen)
   const [selected, setSelected] = useState<FileRow | null>(null)
   const [timeline, setTimeline] = useState<FileTouchRow[]>([])
   const [loading, setLoading] = useState(true)
+  const [openDiffs, setOpenDiffs] = useState<Set<number>>(new Set())
+  const [editsOnly, setEditsOnly] = useState(false)
 
   useEffect(() => {
     let cancelled = false
@@ -106,8 +136,12 @@ export function FilesTab({ onOpenSession }: { onOpenSession: (o: TranscriptOpen)
               <div className="px-3.5 pb-3 pt-3">
                 <h2 className="section-title truncate">{selected.basename}</h2>
                 <p className="mono mt-0.5 truncate text-ink-3">{selected.path}</p>
+                <label className="mt-2 flex cursor-pointer items-center gap-2 text-[13px] text-ink-2">
+                  <input type="checkbox" className="check" checked={editsOnly} onChange={(e) => setEditsOnly(e.target.checked)} />
+                  {t('files.editsOnly')}
+                </label>
               </div>
-              {timeline.map((row) => (
+              {timeline.filter((row) => !editsOnly || EDITING.test(row.preview)).map((row) => (
                 <article key={row.messageId} className="row">
                   <div className="flex items-start gap-2">
                     <div className="row-meta flex-1">
@@ -116,6 +150,23 @@ export function FilesTab({ onOpenSession }: { onOpenSession: (o: TranscriptOpen)
                       {row.gitBranch ? <span className="badge tone-gray mono">{row.gitBranch}</span> : null}
                       {row.tsMs ? <span className="tabular">{formatTs(row.tsMs, locale)}</span> : null}
                     </div>
+                    {EDITING.test(row.preview) && (
+                      <button
+                        type="button"
+                        className="btn btn-tertiary btn-xs shrink-0"
+                        aria-expanded={openDiffs.has(row.messageId)}
+                        onClick={() =>
+                          setOpenDiffs((prev) => {
+                            const n = new Set(prev)
+                            if (n.has(row.messageId)) n.delete(row.messageId)
+                            else n.add(row.messageId)
+                            return n
+                          })
+                        }
+                      >
+                        {openDiffs.has(row.messageId) ? t('diff.hide') : t('diff.show')}
+                      </button>
+                    )}
                     <button
                       type="button"
                       className="btn btn-secondary btn-xs shrink-0"
@@ -134,6 +185,7 @@ export function FilesTab({ onOpenSession }: { onOpenSession: (o: TranscriptOpen)
                   <p className="mono mt-1.5 line-clamp-2 whitespace-pre-wrap break-words leading-[1.55] text-ink-2 [overflow-wrap:anywhere]">
                     {row.preview}
                   </p>
+                  {openDiffs.has(row.messageId) && <TouchDiff messageId={row.messageId} path={selected.path} />}
                 </article>
               ))}
             </>

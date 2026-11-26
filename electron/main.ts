@@ -1,6 +1,6 @@
 import path from 'node:path'
 import fs from 'node:fs'
-import { app, BrowserWindow, clipboard, dialog, ipcMain, shell } from 'electron'
+import { app, BrowserWindow, clipboard, dialog, globalShortcut, ipcMain, Notification, shell } from 'electron'
 import chokidar, { type FSWatcher } from 'chokidar'
 import { getSetting, setSetting, type DbHandle } from './db.js'
 import {
@@ -22,6 +22,7 @@ import { allAdapters } from './adapters.js'
 import { archiveModeOf } from './indexer.js'
 import { BackupFailed, IndexService } from './indexService.js'
 import { migrateLegacyUserData } from './userDataMigration.js'
+import { mcpLaunch, resolveDbPath, runMcpServer } from './mcpServer.js'
 import { QueryService } from './queryService.js'
 import { checkForUpdates, getUpdateStatus, initAutoUpdate, installUpdate, setAutoUpdateEnabled } from './updater.js'
 import { listPrices, resetPrices, savePrices } from './prices.js'
@@ -42,7 +43,8 @@ import {
   sessionInfo,
   setMessageTags,
 } from './queries.js'
-import { DEFAULT_BACKUP_KEEP, IPC } from '../shared/ipc.js'
+import { DEFAULT_BACKUP_KEEP, GLOBAL_SHORTCUT_CHOICES, IPC } from '../shared/ipc.js'
+import { redactSecrets } from '../shared/redact.js'
 import { localDay } from '../shared/appOpens.js'
 import type {
   BackupInfo,
@@ -52,6 +54,7 @@ import type {
   FileRow,
   FileTouchRow,
   IndexProgress,
+  McpCommand,
   PlanListRow,
   PromptRow,
   ReindexResult,
@@ -62,12 +65,22 @@ import type {
   StatsPayload,
   TemplateRow,
   UnifiedSearchHit,
+  MaskedText,
+  SessionDetail,
+  SessionListResult,
+  TranscriptPage,
 } from '../shared/ipc.js'
 import type { WatchEventKind } from './workerProtocol.js'
 import {
   sanitizeClipboardText,
+  sanitizeExportFileFormat,
   sanitizeExportFormat,
   sanitizeExportMessageIds,
+  sanitizeLocale,
+  sanitizeSessionExportFormat,
+  sanitizeSessionExportOptions,
+  sanitizeSessionListQuery,
+  sanitizeTranscriptWindow,
   sanitizeFilePath,
   sanitizeFileQuery,
   sanitizeExportOptions,
@@ -91,10 +104,16 @@ import {
 // __dirname is provided by Node's module wrapper — no import.meta.url shim needed.
 declare const __dirname: string
 
+/**
+ * `Trove --mcp`: serve the local MCP server (ADR-0011) on stdio instead of starting the
+ * app — no window, no index worker, no single-instance lock, nothing written.
+ */
+const MCP_MODE = process.argv.includes('--mcp')
+
 // Test/dev override: keep the vault DB somewhere disposable instead of the real profile.
 const userDataOverride = process.env.VAULT_USER_DATA?.trim()
 if (userDataOverride && path.isAbsolute(userDataOverride)) app.setPath('userData', userDataOverride)
-else {
+else if (!MCP_MODE) {
   // Before anything opens the folder (single-instance lock, Chromium, the DB).
   try {
     const from = migrateLegacyUserData(app.getPath('appData'), app.getPath('userData'))
@@ -133,6 +152,78 @@ function sendToRenderer(channel: string, ...args: unknown[]) {
 
 function broadcastIndexUpdated() {
   sendToRenderer(IPC.onIndexUpdated)
+  noteArchiveNews()
+}
+
+/**
+ * Claude Code deletes old transcripts quietly; say so when Trove kept some. The count
+ * already announced lives in `meta`, so a restart does not repeat the notice and the
+ * first run only records a baseline.
+ */
+function noteArchiveNews() {
+  if (!db) return
+  try {
+    const total = (db.prepare(`SELECT COUNT(*) AS c FROM sessions WHERE archived_at IS NOT NULL`).get() as { c: number }).c
+    const seenRaw = getSetting(db, 'archiveNotifiedCount')
+    setSetting(db, 'archiveNotifiedCount', String(total))
+    if (seenRaw == null) return
+    const added = total - Number(seenRaw)
+    if (!(added > 0)) return
+    sendToRenderer(IPC.onArchiveNews, { newlyArchived: added, totalArchived: total })
+    if (getSetting(db, 'archiveNotify') !== 'off' && Notification.isSupported()) {
+      const s = MAIN_STRINGS[mainLocale()]
+      new Notification({
+        title: APP_NAME,
+        body: fillText(s.archivedNotice, { count: added, total }),
+        silent: true,
+      }).show()
+    }
+  } catch (err) {
+    console.error('[vault] archive notice failed:', err)
+  }
+}
+
+/** Shows the window and puts the cursor in the search box. */
+function summonSearch() {
+  if (!mainWindow) {
+    if (db) createWindow()
+  } else {
+    if (mainWindow.isMinimized()) mainWindow.restore()
+    mainWindow.show()
+    mainWindow.focus()
+  }
+  const send = () => sendToRenderer(IPC.onFocusSearch)
+  const win = liveWindow()
+  if (win?.webContents.isLoading()) win.webContents.once('did-finish-load', send)
+  else send()
+}
+
+let registeredShortcut = ''
+/** Registers the configured global shortcut; returns false when another app holds it. */
+function applyGlobalShortcut(accelerator: string): boolean {
+  if (registeredShortcut) globalShortcut.unregister(registeredShortcut)
+  registeredShortcut = ''
+  if (!accelerator) return true
+  try {
+    if (globalShortcut.register(accelerator, summonSearch)) {
+      registeredShortcut = accelerator
+      return true
+    }
+  } catch (err) {
+    console.error('[vault] global shortcut failed:', err)
+  }
+  return false
+}
+
+/** Masks secrets in text leaving the app when the setting is on (the default). */
+function maskOutgoing(text: string): MaskedText {
+  if (db && getSetting(db, 'maskSecrets') === 'off') return { text, masked: 0 }
+  const r = redactSecrets(text)
+  return { text: r.text, masked: r.count }
+}
+
+function maskingOn(): boolean {
+  return !db || getSetting(db, 'maskSecrets') !== 'off'
 }
 
 function broadcastIndexProgress(p: IndexProgress) {
@@ -214,7 +305,15 @@ function readSettings(): Settings {
     archiveMode: db ? archiveModeOf(db) : 'keep',
     autoUpdate: db ? getSetting(db, 'autoUpdate') !== 'off' : true,
     backupKeep: db ? backupKeepOf(db) : DEFAULT_BACKUP_KEEP,
+    maskSecrets: db ? getSetting(db, 'maskSecrets') !== 'off' : true,
+    globalShortcut: globalShortcutSetting(),
+    archiveNotify: db ? getSetting(db, 'archiveNotify') !== 'off' : true,
   }
+}
+
+function globalShortcutSetting(): string {
+  const v = db ? getSetting(db, 'globalShortcut') : null
+  return v && (GLOBAL_SHORTCUT_CHOICES as readonly string[]).includes(v) ? v : ''
 }
 
 let lastOpenDay = ''
@@ -411,13 +510,61 @@ function registerIpc() {
   ipcMain.handle(IPC.updateCheck, async () => checkForUpdates())
   ipcMain.handle(IPC.updateInstall, async () => installUpdate())
 
+  ipcMain.handle(
+    IPC.mcpCommand,
+    async (): Promise<McpCommand> =>
+      mcpLaunch({
+        packaged: app.isPackaged,
+        execPath: process.execPath,
+        appPath: app.getAppPath(),
+        dbFile: vaultDbPath(),
+      }),
+  )
+
   ipcMain.handle(IPC.reindex, async (_e, rawReparse: unknown): Promise<ReindexResult> => {
     if (!indexService) return { projects: 0, sessions: 0, planFiles: 0 }
     return indexService.scan(rawReparse === true)
   })
 
-  ipcMain.handle(IPC.copyText, async (_e, raw: unknown) => {
-    clipboard.writeText(sanitizeClipboardText(raw))
+  // Resolves to how many secrets were masked, so the renderer can say so.
+  ipcMain.handle(IPC.copyText, async (_e, raw: unknown): Promise<number> => {
+    const out = maskOutgoing(sanitizeClipboardText(raw))
+    clipboard.writeText(out.text)
+    return out.masked
+  })
+
+  ipcMain.handle(IPC.sessionsList, async (_e, raw: unknown): Promise<SessionListResult> =>
+    db ? query<SessionListResult>('sessionsList', sanitizeSessionListQuery(raw)) : { rows: [], total: 0 },
+  )
+
+  ipcMain.handle(IPC.sessionDetail, async (_e, raw: unknown): Promise<SessionDetail | null> => {
+    const sessionId = sanitizeSessionId(raw)
+    return db && sessionId != null ? query<SessionDetail | null>('sessionDetail', sessionId) : null
+  })
+
+  ipcMain.handle(IPC.transcriptPage, async (_e, rawId: unknown, rawWindow: unknown): Promise<TranscriptPage> => {
+    const sessionId = sanitizeSessionId(rawId)
+    if (!db || sessionId == null) return { rows: [], from: 0, total: 0 }
+    return query<TranscriptPage>('transcriptPage', sessionId, sanitizeTranscriptWindow(rawWindow))
+  })
+
+  ipcMain.handle(
+    IPC.exportSession,
+    async (_e, rawId: unknown, rawFormat: unknown, rawOpts: unknown, rawLocale: unknown): Promise<MaskedText> => {
+      const sessionId = sanitizeSessionId(rawId)
+      if (!db || sessionId == null) return { text: '', masked: 0 }
+      return query<MaskedText>('exportSession', sessionId, sanitizeSessionExportFormat(rawFormat), {
+        ...sanitizeSessionExportOptions(rawOpts),
+        mask: maskingOn(),
+        locale: sanitizeLocale(rawLocale),
+      })
+    },
+  )
+
+  ipcMain.handle(IPC.handoffPrompt, async (_e, rawId: unknown, rawLocale: unknown): Promise<MaskedText> => {
+    const sessionId = sanitizeSessionId(rawId)
+    if (!db || sessionId == null) return { text: '', masked: 0 }
+    return query<MaskedText>('handoffPrompt', sessionId, { mask: maskingOn(), locale: sanitizeLocale(rawLocale) })
   })
 
   ipcMain.handle(IPC.favoritesList, async () => (db ? listFavorites(db) : []))
@@ -485,6 +632,13 @@ function registerIpc() {
         // Lowering the count applies right away; 0 stops new backups but deletes none.
         pruneBackups(backupsDir(), patch.backupKeep)
         if (dailyBackupDue(backupsDir(), patch.backupKeep)) void runBackup('daily')
+      }
+      if (patch.maskSecrets != null) setSetting(db, 'maskSecrets', patch.maskSecrets ? 'on' : 'off')
+      if (patch.archiveNotify != null) setSetting(db, 'archiveNotify', patch.archiveNotify ? 'on' : 'off')
+      if (patch.globalShortcut != null) {
+        // A shortcut another app already holds is not saved, so the setting never lies.
+        if (applyGlobalShortcut(patch.globalShortcut)) setSetting(db, 'globalShortcut', patch.globalShortcut)
+        else applyGlobalShortcut(globalShortcutSetting())
       }
     }
     return readSettings()
@@ -587,22 +741,28 @@ function registerIpc() {
       const lines = rows.map((r) =>
         [r.id, r.slug, r.rel_path, r.line_index, r.role, esc(r.body)].join(','),
       )
-      return header + lines.join('\n')
+      return maskOutgoing(header + lines.join('\n')).text
     }
     const parts = rows.map(
       (r) => `### ${r.slug} / ${r.rel_path} (line ${r.line_index}, ${r.role})\n\n${r.body}\n`,
     )
-    return parts.join('\n---\n\n')
+    return maskOutgoing(parts.join('\n---\n\n')).text
   })
 
   ipcMain.handle(IPC.exportSave, async (_e, rawText: unknown, rawFormat: unknown): Promise<ExportSaveResult> => {
     const text = String(rawText ?? '')
     if (!text) return { saved: false }
-    const ext = sanitizeExportFormat(rawFormat)
+    const ext = sanitizeExportFileFormat(rawFormat)
     const stamp = new Date().toISOString().slice(0, 10)
+    const filter =
+      ext === 'csv'
+        ? { name: 'CSV', extensions: ['csv'] }
+        : ext === 'html'
+          ? { name: 'HTML', extensions: ['html'] }
+          : { name: 'Markdown', extensions: ['md'] }
     const opts = {
-      defaultPath: path.join(app.getPath('documents'), `claude-vault-export-${stamp}.${ext}`),
-      filters: [ext === 'csv' ? { name: 'CSV', extensions: ['csv'] } : { name: 'Markdown', extensions: ['md'] }],
+      defaultPath: path.join(app.getPath('documents'), `trove-export-${stamp}.${ext}`),
+      filters: [filter],
     }
     const win = liveWindow()
     const res = win ? await dialog.showSaveDialog(win, opts) : await dialog.showSaveDialog(opts)
@@ -724,6 +884,7 @@ const MAIN_STRINGS = {
     continue: '계속',
     retry: '다시 시도',
     quit: '끝내기',
+    archivedNotice: 'Claude Code가 지운 세션 {count}개를 Trove가 보관했어요. 지금까지 {total}개를 지켰어요.',
     initialIndex: '초기 색인',
     recovered: '색인 DB를 열 수 없어서 백업으로 되돌렸어요.',
     recoveredDetail: '{from} 백업을 썼어요. 그 뒤 바뀐 대화는 ~/.claude에서 다시 색인해요.\n\n열리지 않은 파일은 지우지 않고 남겨 뒀어요:\n{file}',
@@ -750,6 +911,7 @@ const MAIN_STRINGS = {
     continue: 'Continue',
     retry: 'Try again',
     quit: 'Quit',
+    archivedNotice: 'Claude Code deleted {count} sessions; Trove kept them. {total} kept so far.',
     initialIndex: 'initial indexing',
     recovered: 'The index database could not be opened, so a backup was restored.',
     recoveredDetail: 'Restored from {from}. Conversations changed since then are re-indexed from ~/.claude.\n\nThe file that failed to open was kept:\n{file}',
@@ -870,8 +1032,17 @@ function userDataWriteError(): string | null {
   }
 }
 
-// Two instances writing one SQLite file is a corruption risk — focus the first.
-if (!app.requestSingleInstanceLock()) {
+if (MCP_MODE) {
+  // A stdio server, not an app: keep it out of the Dock and never take the instance lock,
+  // so it runs next to an open Trove window.
+  app.dock?.hide()
+  runMcpServer({
+    dbFile: process.argv.some((a) => a === '--db' || a.startsWith('--db=')) || process.env.TROVE_DB ? resolveDbPath() : vaultDbPath(),
+    version: app.getVersion(),
+    exit: (code) => app.exit(code),
+  })
+} else if (!app.requestSingleInstanceLock()) {
+  // Two instances writing one SQLite file is a corruption risk — focus the first.
   // Chromium also fails to take the lock when it cannot create the lock file (a read-only
   // folder, a full disk). Quitting then would look like the app not starting at all.
   const writeError = userDataWriteError()
@@ -919,6 +1090,7 @@ if (!app.requestSingleInstanceLock()) {
       onError: (message) => reportFatal(MAIN_STRINGS[mainLocale()].initialIndex, message),
     })
     registerIpc()
+    if (!applyGlobalShortcut(globalShortcutSetting())) console.warn('[vault] global shortcut is held by another app')
     // Show the window first, then index on the worker so a large ~/.claude never
     // delays first paint. The watcher starts once the initial pass finishes.
     createWindow()
@@ -941,6 +1113,10 @@ if (!app.requestSingleInstanceLock()) {
     app.quit()
   })
 }
+
+app.on('will-quit', () => {
+  globalShortcut.unregisterAll()
+})
 
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') app.quit()

@@ -1,5 +1,5 @@
 
-export type Tab = 'search' | 'prompts' | 'files' | 'favorites' | 'templates' | 'stats' | 'export' | 'settings'
+export type Tab = 'search' | 'sessions' | 'prompts' | 'files' | 'favorites' | 'templates' | 'stats' | 'export' | 'settings'
 
 export type TranscriptOpen = {
   sessionId: number

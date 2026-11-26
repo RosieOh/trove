@@ -13,6 +13,7 @@ export function sidebarPrimaryLabel(displayName: string): string {
 
 const ICONS = {
   search: 'M11 19a8 8 0 1 1 0-16 8 8 0 0 1 0 16Zm10 2-4.35-4.35',
+  sessions: 'M4 6h16M4 12h16M4 18h10m4 0h2',
   prompt: 'M4 5h16v11H8l-4 4V5Zm4 4h8m-8 3h5',
   file: 'M14 3H6a1 1 0 0 0-1 1v16a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1V8l-5-5Zm0 0v5h5',
   star: 'm12 3 2.9 5.9 6.1.9-4.5 4.3 1.1 6.4L12 17.5 6.4 20.5l1.1-6.4L3 9.8l6.1-.9L12 3Z',

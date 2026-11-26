@@ -54,6 +54,12 @@
 
   --mark: color-mix(in srgb, var(--brand) 20%, transparent);
   --bubble-user: color-mix(in srgb, var(--brand) 9%, var(--glass-solid));
+  /* Heatmap ramp (Stats): an empty cell, then four steps of brand. */
+  --heat-0: rgb(22 34 64 / 0.07);
+  --heat-1: color-mix(in srgb, var(--brand) 22%, transparent);
+  --heat-2: color-mix(in srgb, var(--brand) 45%, transparent);
+  --heat-3: color-mix(in srgb, var(--brand) 72%, transparent);
+  --heat-4: var(--brand-lo);
 }
 
 .dark {
@@ -95,6 +101,11 @@
 
   --mark: color-mix(in srgb, var(--brand) 30%, transparent);
   --bubble-user: color-mix(in srgb, var(--brand) 16%, var(--glass-solid));
+  --heat-0: rgb(255 255 255 / 0.06);
+  --heat-1: color-mix(in srgb, var(--brand) 28%, transparent);
+  --heat-2: color-mix(in srgb, var(--brand) 50%, transparent);
+  --heat-3: color-mix(in srgb, var(--brand) 76%, transparent);
+  --heat-4: var(--brand-hi);
 }
 
 @layer base {
@@ -990,6 +1001,26 @@
     border-radius: 0 4px 4px 0;
     background: var(--brand);
   }
+  /* Heatmap cells: `heat-0` (none) to `heat-4` (busiest). */
+  .heat {
+    border-radius: 3px;
+    background: var(--heat-0);
+  }
+  .heat-1 {
+    background: var(--heat-1);
+  }
+  .heat-2 {
+    background: var(--heat-2);
+  }
+  .heat-3 {
+    background: var(--heat-3);
+  }
+  .heat-4 {
+    background: var(--heat-4);
+  }
+  .heat-future {
+    background: transparent;
+  }
 }
 
 /* ── Motion ─────────────────────────────────────────────────────────────── */
@@ -1067,4 +1098,43 @@
 .row[data-active='true'] .row-check,
 .row-check:checked {
   opacity: 1;
+}
+
+/* File-edit diffs: tints derived from the tone tokens, so both themes follow ADR-0009. */
+.diff {
+  border-radius: 12px;
+  border: 1px solid var(--line);
+  background: var(--well);
+  overflow: auto;
+  max-height: min(60vh, 28rem);
+}
+.diff-line {
+  display: grid;
+  grid-template-columns: 1.5rem 1fr;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  line-height: 1.55;
+  padding-right: 0.75rem;
+}
+.diff-sign {
+  text-align: center;
+  color: var(--ink-3);
+  user-select: none;
+}
+.diff-add {
+  background: color-mix(in srgb, var(--tone-green) 14%, transparent);
+}
+.diff-add .diff-sign {
+  color: var(--tone-green);
+}
+.diff-del {
+  background: color-mix(in srgb, var(--tone-rose) 13%, transparent);
+}
+.diff-del .diff-sign {
+  color: var(--tone-rose);
+}
+.diff-gap {
+  padding: 0.125rem 0.75rem;
+  color: var(--ink-3);
+  background: var(--well);
 }

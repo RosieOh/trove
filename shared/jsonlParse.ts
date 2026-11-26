@@ -48,6 +48,33 @@ export type ParsedLine = {
   isPrompt: boolean
   /** The prompt as typed, with IDE/harness wrappers removed; null unless `isPrompt`. */
   promptText: string | null
+  /**
+   * A session title this line sets: `custom-title` (the user's /rename) outranks
+   * `ai-title`, which outranks a legacy `summary`. Absent on other lines.
+   */
+  sessionTitle?: SessionTitle | null
+}
+
+/** Rank decides which title wins when a session carries several: 3 custom, 2 ai, 1 summary. */
+export type SessionTitle = { text: string; rank: 1 | 2 | 3 }
+
+/** The title a line sets, if any. */
+export function sessionTitleOf(obj: Record<string, unknown>): SessionTitle | null {
+  const type = str(obj.type)
+  const clean = (v: unknown) => (typeof v === 'string' ? v.replace(/\s+/g, ' ').trim().slice(0, 300) : '')
+  if (type === 'custom-title') {
+    const t = clean(obj.customTitle) || clean(obj.title)
+    return t ? { text: t, rank: 3 } : null
+  }
+  if (type === 'ai-title') {
+    const t = clean(obj.aiTitle) || clean(obj.title)
+    return t ? { text: t, rank: 2 } : null
+  }
+  if (type === 'summary') {
+    const t = clean(obj.summary)
+    return t ? { text: t, rank: 1 } : null
+  }
+  return null
 }
 
 function truncate(s: string, max: number): string {
@@ -92,6 +119,7 @@ const OPERATIONAL_TYPES = new Set([
   'last-prompt',
   'ai-title',
   'pr-link',
+  'custom-title',
   'session-id',
   'model-info',
   'version-info',
@@ -147,6 +175,14 @@ export function operationalLabel(obj: Record<string, unknown>, type: string): st
     case 'ai-title': {
       const t = str(obj.aiTitle) || str(obj.title)
       return t ? `[제목] ${t}` : '[제목]'
+    }
+    case 'custom-title': {
+      const t = str(obj.customTitle) || str(obj.title)
+      return t ? `[제목] ${t}` : '[제목]'
+    }
+    case 'summary': {
+      const t = str(obj.summary)
+      return t ? `[요약] ${t}` : '[요약]'
     }
     case 'pr-link': {
       const n = obj.prNumber
@@ -667,5 +703,6 @@ export function parseJsonlLine(line: string): ParsedLine | null {
     requestId: apiMessageId ? str(obj.requestId) || null : null,
     isPrompt: promptText != null,
     promptText,
+    sessionTitle: conversational ? null : sessionTitleOf(obj),
   }
 }

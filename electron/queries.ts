@@ -30,7 +30,7 @@ export function listProjects(db: DbHandle): ProjectRow[] {
   return rows.map(({ archivedAt, ...r }) => ({ ...r, tool: r.tool ?? 'claude', archived: archivedAt != null }))
 }
 
-export function recentSessions(db: DbHandle, projectId: number | null): RecentSessionRow[] {
+export function recentSessions(db: DbHandle, projectId: number | null, limit = 18): RecentSessionRow[] {
   const rows = db
     .prepare(
       `SELECT s.id AS sessionId,
@@ -46,13 +46,23 @@ export function recentSessions(db: DbHandle, projectId: number | null): RecentSe
        -- Subagent transcripts are parts of a session, not sessions a person opened.
        WHERE (? IS NULL OR p.id = ?) AND s.rel_path NOT LIKE '%subagents%'
        ORDER BY s.file_mtime_ms DESC
-       LIMIT 18`,
+       LIMIT ?`,
     )
-    .all(projectId, projectId) as (Omit<RecentSessionRow, 'archived'> & { archived: number })[]
+    .all(projectId, projectId, Math.min(Math.max(Math.trunc(limit), 1), 200)) as (Omit<RecentSessionRow, 'archived'> & { archived: number })[]
   return rows.map((r) => ({ ...r, archived: Boolean(r.archived) }))
 }
 
-export function sessionTranscript(db: DbHandle, sessionId: number): SessionMessageRow[] {
+/**
+ * A session's rows in line order. The default window is the first 25k rows; callers that
+ * page (the transcript view, exports) pass `offset`/`limit` explicitly.
+ */
+export function sessionTranscript(
+  db: DbHandle,
+  sessionId: number,
+  opts: { offset?: number; limit?: number } = {},
+): SessionMessageRow[] {
+  const limit = Math.max(1, Math.trunc(opts.limit ?? 25000))
+  const offset = Math.max(0, Math.trunc(opts.offset ?? 0))
   const rows = db
     .prepare(
       `SELECT m.id AS messageId, m.msg_key AS msgKey, m.line_index AS lineIndex, m.role, m.body,
@@ -61,7 +71,7 @@ export function sessionTranscript(db: DbHandle, sessionId: number): SessionMessa
        FROM messages m
        WHERE m.session_id = ?
        ORDER BY m.line_index ASC
-       LIMIT 25000`,
+       LIMIT ${limit} OFFSET ${offset}`,
     )
     .all(sessionId) as (Omit<SessionMessageRow, 'contentKinds'> & { contentKinds: string | null })[]
   return rows.map((r): SessionMessageRow => {

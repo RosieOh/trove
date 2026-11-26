@@ -1,6 +1,5 @@
 import type { DbHandle } from './db.js'
-import type { ModelTokenRow } from '../shared/ipc.js'
-import type { StatsPayload } from '../shared/ipc.js'
+import type { ModelTokenRow, ProjectUsageRow, StatsPayload, ToolUsageRow, UsageBlock } from '../shared/ipc.js'
 
 const STOP = new Set([
   'the',
@@ -87,7 +86,231 @@ const ROLES_SQL = `
   ORDER BY count DESC, role
 `
 
-export function computeStats(db: DbHandle): StatsPayload {
+/** Local `YYYY-MM-DD` of a timestamp, the same day key `activityByDay` uses. */
+export function localDay(ms: number): string {
+  const d = new Date(ms)
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
+}
+
+/** First day (a Sunday, local midnight) of the 53-week grid that ends with the week of `now`. */
+export function yearGridStart(now: Date): Date {
+  return new Date(now.getFullYear(), now.getMonth(), now.getDate() - now.getDay() - 52 * 7)
+}
+
+/**
+ * Prompts per local day for the year grid and per weekday × hour, in one pass over the prompt
+ * lines. Local time is taken in JS: SQLite's `localtime` has no cheap weekday/hour pair and
+ * leans on the C library's idea of the zone.
+ */
+function promptActivity(db: DbHandle, now: Date): Pick<StatsPayload, 'activityYear' | 'activityByHour'> {
+  const from = yearGridStart(now).getTime()
+  const byDay = new Map<string, number>()
+  const byHour = new Array<number>(7 * 24).fill(0)
+  for (const { ts } of db
+    .prepare(`SELECT MIN(ts_ms) AS ts FROM ${PROMPTS} WHERE is_prompt = 1 AND ts_ms IS NOT NULL GROUP BY msg_key`)
+    .iterate() as Iterable<{ ts: number }>) {
+    const d = new Date(ts)
+    byHour[d.getDay() * 24 + d.getHours()]++
+    if (ts >= from) {
+      const key = localDay(ts)
+      byDay.set(key, (byDay.get(key) ?? 0) + 1)
+    }
+  }
+  return {
+    activityYear: [...byDay.entries()].sort((a, b) => (a[0] < b[0] ? -1 : 1)).map(([day, count]) => ({ day, count })),
+    activityByHour: byHour.flatMap((count, i) => (count > 0 ? [{ weekday: Math.floor(i / 24), hour: i % 24, count }] : [])),
+  }
+}
+
+const HOUR_MS = 3_600_000
+const BLOCK_MS = 5 * HOUR_MS
+
+type Response = {
+  sessionId: number
+  ts: number | null
+  model: string | null
+  input: number
+  output: number
+  cacheRead: number
+  cacheCreation: number
+  cacheCreation1h: number
+}
+
+/**
+ * Responses grouped as `RESPONSES_SQL` groups them, each with the session (and so the
+ * project) and the time it first appears at. A response that a fork copied into another
+ * session is still one response, so it goes to one project only: the one holding its
+ * lowest session id. Read from the covering idx_messages_usage_where.
+ */
+const RESPONSES_WHERE_SQL = `
+  SELECT MIN(session_id) AS sessionId,
+         MIN(ts_ms) AS ts,
+         MAX(model) AS model,
+         MAX(COALESCE(input_tokens, 0)) AS input,
+         MAX(COALESCE(output_tokens, 0)) AS output,
+         MAX(COALESCE(cache_read_tokens, 0)) AS cacheRead,
+         MAX(COALESCE(cache_creation_tokens, 0)) AS cacheCreation,
+         MAX(COALESCE(cache_creation_1h_tokens, 0)) AS cacheCreation1h
+  FROM messages INDEXED BY idx_messages_usage_where
+  WHERE input_tokens IS NOT NULL
+  GROUP BY CASE WHEN api_msg_id IS NOT NULL THEN api_msg_id || ':' || COALESCE(request_id, '')
+                ELSE 'key:' || msg_key END
+`
+
+/**
+ * Claude subscription windows: a block opens at the first response after the previous one
+ * closed, floored to the hour, and lasts five hours. `responses` must be in time order;
+ * the last `keep` blocks come back, oldest first.
+ */
+export function usageBlocks(
+  responses: Iterable<Pick<Response, 'ts' | 'input' | 'output' | 'cacheRead' | 'cacheCreation'>>,
+  keep = 10,
+): UsageBlock[] {
+  const blocks: UsageBlock[] = []
+  let cur: UsageBlock | null = null
+  for (const r of responses) {
+    if (r.ts == null) continue
+    if (!cur || r.ts >= cur.endMs) {
+      const startMs = Math.floor(r.ts / HOUR_MS) * HOUR_MS
+      cur = { startMs, endMs: startMs + BLOCK_MS, responses: 0, input: 0, output: 0, cacheRead: 0, cacheCreation: 0 }
+      blocks.push(cur)
+      if (blocks.length > keep) blocks.shift()
+    }
+    cur.responses++
+    cur.input += r.input
+    cur.output += r.output
+    cur.cacheRead += r.cacheRead
+    cur.cacheCreation += r.cacheCreation
+  }
+  return blocks
+}
+
+type TokenSums = { input: number; output: number; cacheRead: number; cacheCreation: number; cacheCreation1h: number }
+
+function addTokens(to: TokenSums, r: TokenSums) {
+  to.input += r.input
+  to.output += r.output
+  to.cacheRead += r.cacheRead
+  to.cacheCreation += r.cacheCreation
+  to.cacheCreation1h += r.cacheCreation1h
+}
+
+const allTokens = (r: { input: number; output: number; cacheRead: number; cacheCreation: number }) =>
+  r.input + r.output + r.cacheRead + r.cacheCreation
+
+/** Usage per project and the 5-hour blocks, from one pass over the responses. */
+function responseUsage(db: DbHandle): Pick<StatsPayload, 'tokensByProject' | 'usageBlocks'> {
+  const projectOf = new Map<number, number>()
+  for (const r of db.prepare(`SELECT id, project_id AS projectId FROM sessions`).iterate() as Iterable<{
+    id: number
+    projectId: number
+  }>) {
+    projectOf.set(r.id, r.projectId)
+  }
+  const projects = new Map<number, ProjectUsageRow & { models: Map<string, ModelTokenRow> }>()
+  for (const p of db
+    .prepare(
+      `SELECT p.id AS projectId, p.display_name AS projectName, COUNT(s.id) AS sessions
+       FROM projects p LEFT JOIN sessions s ON s.project_id = p.id
+       GROUP BY p.id`,
+    )
+    .iterate() as Iterable<{ projectId: number; projectName: string; sessions: number }>) {
+    projects.set(p.projectId, {
+      ...p,
+      responses: 0,
+      input: 0,
+      output: 0,
+      cacheRead: 0,
+      cacheCreation: 0,
+      cacheCreation1h: 0,
+      byModel: [],
+      models: new Map(),
+    })
+  }
+
+  const timed: Response[] = []
+  for (const r of db.prepare(RESPONSES_WHERE_SQL).iterate() as Iterable<Response>) {
+    if (r.ts != null) timed.push(r)
+    const p = projects.get(projectOf.get(r.sessionId) ?? -1)
+    if (!p) continue
+    p.responses++
+    addTokens(p, r)
+    if (!r.model) continue
+    let m = p.models.get(r.model)
+    if (!m) {
+      m = { model: r.model, messages: 0, input: 0, output: 0, cacheRead: 0, cacheCreation: 0, cacheCreation1h: 0 }
+      p.models.set(r.model, m)
+    }
+    m.messages++
+    addTokens(m, r)
+  }
+
+  const tokensByProject = [...projects.values()]
+    .filter((p) => p.responses > 0)
+    .sort((a, b) => allTokens(b) - allTokens(a) || b.responses - a.responses)
+    .slice(0, 15)
+    .map(({ models, ...p }) => ({ ...p, byModel: [...models.values()].sort((a, b) => allTokens(b) - allTokens(a)) }))
+
+  timed.sort((a, b) => (a.ts as number) - (b.ts as number))
+  return { tokensByProject, usageBlocks: usageBlocks(timed) }
+}
+
+/**
+ * Starts of tool result bodies that mark a failed call. The index keeps the result text but
+ * not its `is_error` flag, so this is a heuristic: Claude Code wraps rejected calls in
+ * `<tool_use_error>` and a failed shell command opens with `Exit code <n>`.
+ */
+const TOOL_ERROR = /^(<tool_use_error>|[Ee]rror:|Exit code [1-9])/
+/** `summarizeToolUse` opens every call with `[도구] <Name>`; a line may hold several calls. */
+const TOOL_HEADER = /^\[도구\] ([^\s·]+)/gmu
+
+/**
+ * Calls per tool and how many of their results look like errors. Results carry no tool
+ * name, so each one is matched to the oldest unanswered call before it in its session
+ * (Claude Code answers parallel calls in the order it made them). Only the head of each
+ * body is read — a call's first 200 characters, a result's first 60 — so a second call
+ * further down one long line goes uncounted; Claude Code writes one call per line. Each
+ * line counts once, however many sessions hold it.
+ */
+function toolUsage(db: DbHandle): ToolUsageRow[] {
+  const calls = new Map<string, number>()
+  const errors = new Map<string, number>()
+  const seen = new Set<string>()
+  let session = -1
+  let pending: string[] = []
+  for (const r of db
+    .prepare(
+      `SELECT session_id AS sessionId, msg_key AS key, role,
+              substr(body, 1, CASE WHEN role = 'tool' THEN 60 ELSE 200 END) AS head
+       FROM messages INDEXED BY idx_messages_tool
+       WHERE role = 'tool' OR content_kinds LIKE '%"tool_use"%'
+       ORDER BY session_id, line_index`,
+    )
+    .iterate() as Iterable<{ sessionId: number; key: string; role: string; head: string }>) {
+    if (r.sessionId !== session) {
+      session = r.sessionId
+      pending = []
+    }
+    const fresh = !seen.has(r.key)
+    if (fresh) seen.add(r.key)
+    if (r.role === 'tool') {
+      const tool = pending.shift()
+      if (!fresh || !tool) continue
+      if (TOOL_ERROR.test(r.head.trimStart())) errors.set(tool, (errors.get(tool) ?? 0) + 1)
+      continue
+    }
+    for (const m of r.head.matchAll(TOOL_HEADER)) {
+      pending.push(m[1])
+      if (fresh) calls.set(m[1], (calls.get(m[1]) ?? 0) + 1)
+    }
+  }
+  return [...calls.entries()]
+    .sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : 1))
+    .slice(0, 20)
+    .map(([tool, n]) => ({ tool, calls: n, errors: errors.get(tool) ?? 0 }))
+}
+
+export function computeStats(db: DbHandle, now: Date = new Date()): StatsPayload {
   const totalProjects = (db.prepare(`SELECT COUNT(*) AS c FROM projects`).get() as { c: number }).c
   const totalSessions = (db.prepare(`SELECT COUNT(*) AS c FROM sessions`).get() as { c: number }).c
   const archivedSessions = (
@@ -189,6 +412,9 @@ export function computeStats(db: DbHandle): StatsPayload {
     tokensByModel,
     activityFromTimestamps,
     appOpenDays,
+    ...promptActivity(db, now),
+    ...responseUsage(db),
+    toolUsage: toolUsage(db),
   }
 }
 
@@ -206,4 +432,9 @@ export const EMPTY_STATS: StatsPayload = {
   tokensByModel: [],
   activityFromTimestamps: false,
   appOpenDays: [],
+  activityYear: [],
+  activityByHour: [],
+  tokensByProject: [],
+  toolUsage: [],
+  usageBlocks: [],
 }

@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react'
-import type { ModelTokenRow, StatsPayload } from '../../shared/ipc'
+import type { ModelTokenRow, ProjectUsageRow, StatsPayload, ToolUsageRow, UsageBlock } from '../../shared/ipc'
 import { OPENAI_PRICES_AS_OF, PRICES_AS_OF, costOf, formatUsd, type ModelPrice } from '../../shared/pricing'
 import { BCP47 } from '../../shared/i18n'
 import { useI18n, useT } from '../i18n'
@@ -236,6 +236,382 @@ function ActivityChart({ days }: { days: { day: string; count: number }[] }) {
   )
 }
 
+const dayKey = (d: Date) =>
+  `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
+
+/** Cell classes by heat step, spelled out in full so Tailwind keeps the component classes. */
+const HEAT = ['heat', 'heat heat-1', 'heat heat-2', 'heat heat-3', 'heat heat-4']
+
+/** Heat step 0–4 relative to the busiest cell, so a quiet year still shows its shape. */
+function heatLevel(count: number, max: number): number {
+  if (count <= 0) return 0
+  return Math.min(4, Math.max(1, Math.ceil((count / Math.max(1, max)) * 4)))
+}
+
+function HeatLegend() {
+  const t = useT()
+  return (
+    <div className="flex items-center justify-end gap-1.5 text-[11px] text-ink-3" aria-hidden>
+      <span>{t('stats.heat.less')}</span>
+      {[0, 1, 2, 3, 4].map((l) => (
+        <span key={l} className={`${HEAT[l]} h-2.5 w-2.5`} />
+      ))}
+      <span>{t('stats.heat.more')}</span>
+    </div>
+  )
+}
+
+/** Short weekday name; 2026-01-04 was a Sunday, so `weekday` 0–6 maps onto Jan 4–10. */
+const weekdayName = (weekday: number, locale: string, style: 'short' | 'long' = 'short') =>
+  new Date(2026, 0, 4 + weekday).toLocaleDateString(locale, { weekday: style })
+
+/**
+ * Prompts per day over 53 weeks, one column per week (Sunday on top) like a contribution
+ * graph. Every cell carries its own label; the table view lists the same numbers.
+ */
+function YearHeatmap({ days }: { days: { day: string; count: number }[] }) {
+  const { locale, t } = useI18n()
+  const [asTable, setAsTable] = useState(false)
+  const bcp = BCP47[locale]
+  const grid = useMemo(() => {
+    const byDay = new Map(days.map((d) => [d.day, d.count]))
+    const now = new Date()
+    const today = dayKey(now)
+    const start = new Date(now.getFullYear(), now.getMonth(), now.getDate() - now.getDay() - 52 * 7)
+    const weeks: { day: string; date: Date; count: number; future: boolean }[][] = []
+    for (let w = 0; w < 53; w++) {
+      const week = []
+      for (let d = 0; d < 7; d++) {
+        const date = new Date(start.getFullYear(), start.getMonth(), start.getDate() + w * 7 + d)
+        const day = dayKey(date)
+        week.push({ day, date, count: byDay.get(day) ?? 0, future: day > today })
+      }
+      weeks.push(week)
+    }
+    return weeks
+  }, [days])
+  const max = Math.max(1, ...days.map((d) => d.count))
+  const total = days.reduce((n, d) => n + d.count, 0)
+  // A month label over the first week that starts in it; skipped when the next one would crowd it.
+  const months = grid.flatMap((week, i) => {
+    const m = week[0].date.getMonth()
+    if (i > 0 && grid[i - 1][0].date.getMonth() === m) return []
+    if (i === 0 && grid[2]?.[0].date.getMonth() !== m) return []
+    return [{ col: i, label: week[0].date.toLocaleDateString(bcp, { month: 'short' }) }]
+  })
+  const cols = '2rem repeat(53, minmax(0, 1fr))'
+
+  return (
+    <section className="glass panel flex flex-col gap-4 p-5">
+      <div className="section-head">
+        <div>
+          <h2 className="section-title">{t('stats.year.title')}</h2>
+          <p className="section-desc">
+            {t('stats.year.desc')} {t('stats.year.summary', { days: days.length, total: total.toLocaleString() })}
+          </p>
+        </div>
+        <button type="button" className={GHOST_BTN} onClick={() => setAsTable((v) => !v)} aria-pressed={asTable}>
+          {asTable ? t('stats.chartView') : t('stats.tableView')}
+        </button>
+      </div>
+      {asTable ? (
+        <div className="max-h-72 overflow-y-auto">
+          <table className="table">
+            <thead>
+              <tr>
+                <th>{t('stats.table.day')}</th>
+                <th className="text-right">{t('stats.table.prompts')}</th>
+              </tr>
+            </thead>
+            <tbody>
+              {[...days].reverse().map((d) => (
+                <tr key={d.day}>
+                  <td className="tabular">{d.day}</td>
+                  <td className="text-right tabular">{d.count.toLocaleString()}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      ) : (
+        <div className="flex flex-col gap-1.5">
+          <div className="grid gap-[3px] text-[11px] text-ink-3" style={{ gridTemplateColumns: cols }} aria-hidden>
+            {months.map((m) => (
+              <span key={m.col} className="whitespace-nowrap" style={{ gridColumn: m.col + 2, gridRow: 1 }}>
+                {m.label}
+              </span>
+            ))}
+          </div>
+          <div
+            className="grid gap-[3px]"
+            style={{ gridTemplateColumns: cols, gridTemplateRows: 'repeat(7, auto)', gridAutoFlow: 'column' }}
+            role="group"
+            aria-label={t('stats.year.title')}
+          >
+            {[0, 1, 2, 3, 4, 5, 6].map((wd) => (
+              <span key={wd} className="self-center pr-1 text-[10.5px] leading-none text-ink-3" aria-hidden>
+                {wd % 2 === 1 ? weekdayName(wd, bcp) : ''}
+              </span>
+            ))}
+            {grid.flat().map((c) => {
+              if (c.future) return <span key={c.day} className="heat heat-future aspect-square" aria-hidden />
+              const label = `${c.date.toLocaleDateString(bcp, { year: 'numeric', month: 'short', day: 'numeric', weekday: 'short' })} · ${t('stats.prompts.n', { count: c.count })}`
+              return (
+                <span
+                  key={c.day}
+                  role="img"
+                  title={label}
+                  aria-label={label}
+                  className={`${HEAT[heatLevel(c.count, max)]} aspect-square`}
+                />
+              )
+            })}
+          </div>
+          <HeatLegend />
+        </div>
+      )}
+    </section>
+  )
+}
+
+/** Weekday rows (Monday first) × 24 hour columns, local time, all prompts ever. */
+function HourHeatmap({ cells }: { cells: StatsPayload['activityByHour'] }) {
+  const { locale, t } = useI18n()
+  const [asTable, setAsTable] = useState(false)
+  const bcp = BCP47[locale]
+  const at = useMemo(() => {
+    const m = new Map<number, number>()
+    for (const c of cells) m.set(c.weekday * 24 + c.hour, c.count)
+    return m
+  }, [cells])
+  const max = Math.max(1, ...cells.map((c) => c.count))
+  const rows = [1, 2, 3, 4, 5, 6, 0]
+  const hours = Array.from({ length: 24 }, (_, h) => h)
+  const hh = (h: number) => `${String(h).padStart(2, '0')}:00`
+  const cols = '2.5rem repeat(24, minmax(0, 1fr))'
+
+  return (
+    <section className="glass panel flex flex-col gap-4 p-5">
+      <div className="section-head">
+        <div>
+          <h2 className="section-title">{t('stats.hours.title')}</h2>
+          <p className="section-desc">{t('stats.hours.desc')}</p>
+        </div>
+        <button type="button" className={GHOST_BTN} onClick={() => setAsTable((v) => !v)} aria-pressed={asTable}>
+          {asTable ? t('stats.chartView') : t('stats.tableView')}
+        </button>
+      </div>
+      {asTable ? (
+        <div className="overflow-x-auto">
+          <table className="table min-w-[900px]">
+            <thead>
+              <tr>
+                <th>{t('stats.table.weekday')}</th>
+                {hours.map((h) => (
+                  <th key={h} className="!px-1 text-right">
+                    {h}
+                  </th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((wd) => (
+                <tr key={wd}>
+                  <td>{weekdayName(wd, bcp)}</td>
+                  {hours.map((h) => (
+                    <td key={h} className="!px-1 text-right tabular">
+                      {(at.get(wd * 24 + h) ?? 0).toLocaleString()}
+                    </td>
+                  ))}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      ) : (
+        <div className="flex flex-col gap-1.5">
+          <div className="grid gap-[3px] text-[11px] text-ink-3 tabular" style={{ gridTemplateColumns: cols }} aria-hidden>
+            {[0, 6, 12, 18].map((h) => (
+              <span key={h} style={{ gridColumn: h + 2 }}>
+                {h}
+              </span>
+            ))}
+          </div>
+          <div className="grid gap-[3px]" style={{ gridTemplateColumns: cols }} role="group" aria-label={t('stats.hours.title')}>
+            {rows.map((wd) => [
+              <span key={`l${wd}`} className="self-center text-[11px] leading-none text-ink-3" aria-hidden>
+                {weekdayName(wd, bcp)}
+              </span>,
+              ...hours.map((h) => {
+                const count = at.get(wd * 24 + h) ?? 0
+                const label = `${weekdayName(wd, bcp, 'long')} ${hh(h)}–${hh((h + 1) % 24)} · ${t('stats.prompts.n', { count })}`
+                return (
+                  <span
+                    key={`${wd}-${h}`}
+                    role="img"
+                    title={label}
+                    aria-label={label}
+                    className={`${HEAT[heatLevel(count, max)]} h-[18px]`}
+                  />
+                )
+              }),
+            ])}
+          </div>
+          <HeatLegend />
+        </div>
+      )}
+    </section>
+  )
+}
+
+/** Per-project usage, priced per model with the same table as the cost panel. */
+function ProjectUsagePanel({ rows, prices }: { rows: ProjectUsageRow[]; prices: ModelPrice[] }) {
+  const t = useT()
+  const priced = useMemo(
+    () =>
+      rows.map((p) => {
+        const costs = costRows(p.byModel, prices)
+        return {
+          ...p,
+          cost: costs.reduce((n, c) => n + (c.cost ?? 0), 0),
+          unpriced: costs.some((c) => c.cost == null),
+        }
+      }),
+    [rows, prices],
+  )
+  const max = Math.max(1e-9, ...priced.map((p) => p.cost))
+
+  return (
+    <section className="glass panel flex flex-col gap-4 p-5">
+      <div>
+        <h2 className="section-title">{t('stats.projects.title')}</h2>
+        <p className="section-desc">{t('stats.projects.desc')}</p>
+      </div>
+      <div className="overflow-x-auto">
+        <table className="table min-w-[640px]">
+          <thead>
+            <tr>
+              <th>{t('stats.projects.project')}</th>
+              <th className="text-right">{t('stats.projects.sessions')}</th>
+              <th className="text-right">{t('stats.projects.responses')}</th>
+              <th className="text-right">{t('stats.projects.tokens')}</th>
+              <th className="w-[28%]">{t('stats.projects.cost')}</th>
+            </tr>
+          </thead>
+          <tbody>
+            {priced.map((p) => (
+              <tr key={p.projectId}>
+                <td className="max-w-[260px] truncate text-ink-1" title={p.projectName}>
+                  {p.projectName}
+                </td>
+                <td className="text-right tabular">{p.sessions.toLocaleString()}</td>
+                <td className="text-right tabular">{p.responses.toLocaleString()}</td>
+                <td
+                  className="text-right tabular"
+                  title={t('stats.projects.tokensTitle', {
+                    input: formatCompact(p.input),
+                    output: formatCompact(p.output),
+                    cacheRead: formatCompact(p.cacheRead),
+                    cacheCreation: formatCompact(p.cacheCreation),
+                  })}
+                >
+                  {formatCompact(p.input + p.output + p.cacheRead + p.cacheCreation)}
+                </td>
+                <td>
+                  <div className="flex items-center gap-2" title={p.unpriced ? t('stats.projects.unpriced') : undefined}>
+                    <div className="bar-track flex-1">
+                      <div className="bar-fill" style={{ width: `${Math.max(p.cost > 0 ? 1.5 : 0, (p.cost / max) * 100)}%` }} />
+                    </div>
+                    <span className="w-20 shrink-0 text-right tabular text-ink-1">
+                      {formatUsd(p.cost)}
+                      {p.unpriced && <span className="text-tone-amber">*</span>}
+                    </span>
+                  </div>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      {priced.some((p) => p.unpriced) && <p className="text-[12.5px] text-ink-3">* {t('stats.projects.unpriced')}</p>}
+    </section>
+  )
+}
+
+function ToolUsagePanel({ tools }: { tools: ToolUsageRow[] }) {
+  const { locale, t } = useI18n()
+  const max = Math.max(1, ...tools.map((r) => r.calls))
+  const pct = new Intl.NumberFormat(BCP47[locale], { style: 'percent', maximumFractionDigits: 1 })
+  return (
+    <section className="glass panel flex flex-col gap-4 p-5">
+      <div>
+        <h2 className="section-title">{t('stats.tools.title')}</h2>
+        <p className="section-desc">{t('stats.tools.desc')}</p>
+      </div>
+      {tools.map((r) => (
+        <BarRow
+          key={r.tool}
+          label={r.tool}
+          value={t('stats.tools.value', { calls: r.calls.toLocaleString(), rate: pct.format(r.errors / Math.max(1, r.calls)) })}
+          fraction={r.calls / max}
+        />
+      ))}
+      <p className="text-[12.5px] text-ink-3">{t('stats.tools.footnote')}</p>
+    </section>
+  )
+}
+
+function UsageBlocksPanel({ blocks }: { blocks: UsageBlock[] }) {
+  const { locale, t } = useI18n()
+  const bcp = BCP47[locale]
+  const now = Date.now()
+  const time = (ms: number) => new Date(ms).toLocaleTimeString(bcp, { hour: '2-digit', minute: '2-digit' })
+  return (
+    <section className="glass panel flex flex-col gap-4 p-5">
+      <div>
+        <h2 className="section-title">{t('stats.blocks.title')}</h2>
+        <p className="section-desc">{t('stats.blocks.desc')}</p>
+      </div>
+      {blocks.length === 0 ? (
+        <p className="text-[13.5px] text-ink-3">{t('stats.blocks.empty')}</p>
+      ) : (
+        <div className="overflow-x-auto">
+          <table className="table">
+            <thead>
+              <tr>
+                <th>{t('stats.blocks.window')}</th>
+                <th className="text-right">{t('stats.projects.responses')}</th>
+                <th className="text-right">{t('stats.projects.tokens')}</th>
+                <th className="text-right">{t('stats.tokens.cacheRead')}</th>
+              </tr>
+            </thead>
+            <tbody>
+              {[...blocks].reverse().map((b) => (
+                <tr key={b.startMs}>
+                  <td className="whitespace-nowrap">
+                    <span className="tabular text-ink-1">
+                      {new Date(b.startMs).toLocaleDateString(bcp, { month: 'short', day: 'numeric' })} {time(b.startMs)}–{time(b.endMs)}
+                    </span>
+                    {now >= b.startMs && now < b.endMs && <span className="badge tone-green ml-2">{t('stats.blocks.active')}</span>}
+                  </td>
+                  <td className="text-right tabular">{b.responses.toLocaleString()}</td>
+                  <td
+                    className="text-right tabular"
+                    title={`${t('stats.tokens.input')} ${formatCompact(b.input)} · ${t('stats.tokens.output')} ${formatCompact(b.output)}`}
+                  >
+                    {formatCompact(b.input + b.output)}
+                  </td>
+                  <td className="text-right tabular">{formatCompact(b.cacheRead)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </section>
+  )
+}
+
 export function StatsTab({ stats }: { stats: StatsPayload | null }) {
   const { t } = useI18n()
   const [prices, setPrices] = useState<ModelPrice[] | null>(null)
@@ -293,6 +669,10 @@ export function StatsTab({ stats }: { stats: StatsPayload | null }) {
       </div>
 
       {stats.activityByDay.length > 0 && <ActivityChart days={stats.activityByDay} />}
+
+      {stats.activityYear.length > 0 && <YearHeatmap days={stats.activityYear} />}
+
+      {stats.activityByHour.length > 0 && <HourHeatmap cells={stats.activityByHour} />}
 
       <OpenDaysPanel days={stats.appOpenDays} />
 
@@ -358,6 +738,15 @@ export function StatsTab({ stats }: { stats: StatsPayload | null }) {
 
       {prices && stats.tokensByModel.length > 0 && (
         <CostPanel costs={costs} total={total} prices={prices} onPrices={setPrices} />
+      )}
+
+      {prices && stats.tokensByProject.length > 0 && <ProjectUsagePanel rows={stats.tokensByProject} prices={prices} />}
+
+      {(stats.toolUsage.length > 0 || stats.usageBlocks.length > 0) && (
+        <div className="grid grid-cols-1 gap-4 xl:grid-cols-2">
+          {stats.toolUsage.length > 0 && <ToolUsagePanel tools={stats.toolUsage} />}
+          <UsageBlocksPanel blocks={stats.usageBlocks} />
+        </div>
       )}
 
       {stats.topTokens.length > 0 && (

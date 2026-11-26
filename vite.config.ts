@@ -13,8 +13,9 @@ export default defineConfig({
     electron({
       main: {
         // The two workers are separate entries: they are loaded by path at runtime
-        // (new Worker(.../indexWorker.cjs)), not imported.
-        entry: ['electron/main.ts', 'electron/indexWorker.ts', 'electron/queryWorker.ts'],
+        // (new Worker(.../indexWorker.cjs)), not imported. mcpServer.cjs is run on its
+        // own by Claude Code (`node`, or the app binary with ELECTRON_RUN_AS_NODE=1).
+        entry: ['electron/main.ts', 'electron/indexWorker.ts', 'electron/queryWorker.ts', 'electron/mcpServer.ts'],
         vite: {
           build: {
             outDir: 'dist-electron',

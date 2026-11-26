@@ -1,9 +1,27 @@
 import { useCallback, useEffect, useState } from 'react'
-import { BACKUP_KEEP_CHOICES, type BackupInfo, type BackupReason, type SettingsInfo, type UpdateStatus } from '../../shared/ipc'
+import {
+  BACKUP_KEEP_CHOICES,
+  GLOBAL_SHORTCUT_CHOICES,
+  type BackupInfo,
+  type BackupReason,
+  type McpCommand,
+  type SettingsInfo,
+  type UpdateStatus,
+} from '../../shared/ipc'
 import { LOCALES, LOCALE_LABEL, type MessageKey } from '../../shared/i18n'
 import { useI18n } from '../i18n'
 import { formatTs } from '../format'
 import { Segmented } from '../ui'
+
+const IS_MAC = navigator.userAgent.includes('Mac')
+
+/** `CommandOrControl+Shift+Space` → `⌘⇧Space` on macOS, `Ctrl+Shift+Space` elsewhere. */
+function shortcutLabel(accel: string): string {
+  const mac: Record<string, string> = { CommandOrControl: '⌘', Alt: '⌥', Shift: '⇧' }
+  const other: Record<string, string> = { CommandOrControl: 'Ctrl', Alt: 'Alt', Shift: 'Shift' }
+  const parts = accel.split('+').map((k) => (IS_MAC ? mac[k] : other[k]) ?? k)
+  return IS_MAC ? parts.join('') : parts.join('+')
+}
 
 function formatBytes(n: number): string {
   if (n >= 1 << 30) return `${(n / (1 << 30)).toFixed(2)} GB`
@@ -144,6 +162,39 @@ function BackupSection({ onStatus, refreshKey }: { onStatus: (s: string) => void
   )
 }
 
+/** The `claude mcp add` line that registers Trove's read-only MCP server (ADR-0011). */
+function McpSection({ onStatus }: { onStatus: (s: string) => void }) {
+  const { t } = useI18n()
+  const [cmd, setCmd] = useState<McpCommand | null>(null)
+  useEffect(() => {
+    void window.vault.mcpCommand().then(setCmd)
+  }, [])
+  return (
+    <Section title={t('settings.mcp.title')} desc={t('settings.mcp.help')}>
+      {cmd && (
+        <div className="flex flex-col gap-3">
+          <code className="alert tone-gray mono select-all break-all !text-[12.5px] text-ink-1">
+            {cmd.claudeAddLine}
+          </code>
+          <div className="flex flex-wrap items-center gap-3">
+            <button
+              type="button"
+              className="btn btn-tertiary btn-xs"
+              onClick={async () => {
+                await window.vault.copyText(cmd.claudeAddLine)
+                onStatus(t('settings.mcp.copied'))
+              }}
+            >
+              {t('settings.mcp.copy')}
+            </button>
+            <span className="text-[12.5px] text-ink-3">{t('settings.mcp.note')}</span>
+          </div>
+        </div>
+      )}
+    </Section>
+  )
+}
+
 /**
  * Everything the user may want to decide about their data: what happens when Claude
  * Code deletes transcripts, whether the app may make its one network request, and
@@ -236,6 +287,54 @@ export function SettingsTab({
 
         <BackupSection onStatus={onStatus} refreshKey={backupsVersion} />
 
+        <Section title={t('settings.privacy.title')} desc={t('settings.privacy.help')}>
+          <div className="flex flex-wrap items-center gap-3">
+            <Segmented
+              label={t('settings.privacy.title')}
+              value={info.maskSecrets ? 'on' : 'off'}
+              onChange={(v) => void set({ maskSecrets: v === 'on' })}
+              options={
+                [
+                  ['on', t('settings.on')],
+                  ['off', t('settings.off')],
+                ] as const
+              }
+            />
+          </div>
+          {!info.maskSecrets && <p className="alert tone-amber">{t('settings.privacy.offNote')}</p>}
+        </Section>
+
+        <Section title={t('settings.shortcut.title')} desc={t('settings.shortcut.help')}>
+          <div className="flex flex-wrap items-center gap-3">
+            <Segmented
+            label={t('settings.shortcut.title')}
+            value={info.globalShortcut}
+            onChange={async (v) => {
+              const next = await window.vault.settingsSet({ globalShortcut: v })
+              if (next.globalShortcut !== v) onStatus(t('settings.shortcut.taken'))
+              await load()
+            }}
+            options={GLOBAL_SHORTCUT_CHOICES.map((c) => [c, c ? shortcutLabel(c) : t('settings.off')] as const)}
+          />
+          </div>
+        </Section>
+
+        <Section title={t('settings.notify.title')} desc={t('settings.notify.help')}>
+          <div className="flex flex-wrap items-center gap-3">
+            <Segmented
+            label={t('settings.notify.title')}
+            value={info.archiveNotify ? 'on' : 'off'}
+            onChange={(v) => void set({ archiveNotify: v === 'on' })}
+            options={
+              [
+                ['on', t('settings.on')],
+                ['off', t('settings.off')],
+              ] as const
+            }
+          />
+          </div>
+        </Section>
+
         <Section title={t('settings.update.title')} desc={t('settings.update.help')}>
           <div className="flex flex-wrap items-center gap-3">
             <Segmented
@@ -266,6 +365,8 @@ export function SettingsTab({
             </span>
           </div>
         </Section>
+
+        <McpSection onStatus={onStatus} />
 
         <Section title={t('settings.language.title')}>
           <Segmented

@@ -9,6 +9,7 @@ import type {
   FileRow,
   FileTouchRow,
   IndexProgress,
+  McpCommand,
   PlanListRow,
   ProjectRow,
   PromptQuery,
@@ -26,6 +27,15 @@ import type {
   TemplateRow,
   UpdateStatus,
   UnifiedSearchHit,
+  ArchiveNews,
+  ExportFileFormat,
+  MaskedText,
+  SessionDetail,
+  SessionExportFormat,
+  SessionExportOptions,
+  SessionListQuery,
+  SessionListResult,
+  TranscriptPage,
 } from '../shared/ipc'
 import type { ModelPrice } from '../shared/pricing'
 
@@ -36,7 +46,8 @@ export type VaultApi = {
   plansList: () => Promise<PlanListRow[]>
   planBody: (planId: number) => Promise<string>
   reindex: (reparse?: boolean) => Promise<ReindexResult>
-  copyText: (text: string) => Promise<void>
+  /** Resolves to how many secrets were masked on the way to the clipboard. */
+  copyText: (text: string) => Promise<number>
   messageBody: (messageId: number) => Promise<string>
   favoritesList: () => Promise<FavoriteRow[]>
   favoriteAdd: (messageId: number) => Promise<void>
@@ -48,7 +59,7 @@ export type VaultApi = {
   messageTagsSet: (msgKey: string, tagIds: number[]) => Promise<void>
   stats: () => Promise<StatsPayload>
   exportMessages: (messageIds: number[], format: 'md' | 'csv', opts?: ExportOptions) => Promise<string>
-  exportSave: (text: string, format: 'md' | 'csv') => Promise<ExportSaveResult>
+  exportSave: (text: string, format: ExportFileFormat) => Promise<ExportSaveResult>
   sessionTranscript: (sessionId: number) => Promise<SessionMessageRow[]>
   sessionInfo: (sessionId: number) => Promise<SessionInfo | null>
   recentSessions: (projectId?: number | null) => Promise<RecentSessionRow[]>
@@ -74,9 +85,26 @@ export type VaultApi = {
   updateStatus: () => Promise<UpdateStatus>
   updateCheck: () => Promise<UpdateStatus>
   updateInstall: () => Promise<void>
+  /** How to register Trove's MCP server with Claude Code. */
+  mcpCommand: () => Promise<McpCommand>
   onUpdateStatus: (cb: (s: UpdateStatus) => void) => () => void
   onIndexUpdated: (cb: () => void) => () => void
   onIndexProgress: (cb: (p: IndexProgress) => void) => () => void
+  sessionsList: (q: SessionListQuery) => Promise<SessionListResult>
+  sessionDetail: (sessionId: number) => Promise<SessionDetail | null>
+  /** A window of a transcript: from a row position, or around a line (a search hit). */
+  transcriptPage: (sessionId: number, window: { from?: number; aroundLine?: number }) => Promise<TranscriptPage>
+  exportSession: (
+    sessionId: number,
+    format: SessionExportFormat,
+    opts: SessionExportOptions,
+    locale: 'ko' | 'en',
+  ) => Promise<MaskedText>
+  /** Context to paste into a new session when the old one can no longer be resumed. */
+  handoffPrompt: (sessionId: number, locale: 'ko' | 'en') => Promise<MaskedText>
+  /** The global shortcut was pressed. */
+  onFocusSearch: (cb: () => void) => () => void
+  onArchiveNews: (cb: (n: ArchiveNews) => void) => () => void
 }
 
 declare global {

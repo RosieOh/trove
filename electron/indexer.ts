@@ -189,7 +189,8 @@ export async function indexSessionFile(
       db.prepare(`DELETE FROM messages WHERE session_id = ?`).run(row!.id)
       db.prepare(
         `UPDATE sessions SET project_id = ?, rel_path = ?, message_count = 0, indexed_bytes = 0,
-                head_hash = NULL, tail_hash = NULL WHERE id = ?`,
+                head_hash = NULL, tail_hash = NULL, title = NULL, title_rank = NULL, cwd = NULL,
+                git_branch = NULL, first_ts_ms = NULL, last_ts_ms = NULL WHERE id = ?`,
       ).run(projectId, rel, row!.id)
     })()
   }
@@ -208,6 +209,18 @@ export async function indexSessionFile(
     `UPDATE sessions SET indexed_bytes = ?, message_count = ?, size_bytes = ?, file_mtime_ms = ?,
             head_hash = ?, tail_hash = ? WHERE id = ?`,
   )
+  // Summary columns for the session list: first cwd, latest branch, time span, best title.
+  const updSummary = db.prepare(
+    `UPDATE sessions SET
+       cwd = COALESCE(cwd, ?),
+       git_branch = COALESCE(?, git_branch),
+       first_ts_ms = CASE WHEN ? IS NULL THEN first_ts_ms ELSE MIN(COALESCE(first_ts_ms, ?), ?) END,
+       last_ts_ms = CASE WHEN ? IS NULL THEN last_ts_ms ELSE MAX(COALESCE(last_ts_ms, ?), ?) END
+     WHERE id = ?`,
+  )
+  const updTitle = db.prepare(
+    `UPDATE sessions SET title = ?, title_rank = ? WHERE id = ? AND COALESCE(title_rank, 0) <= ?`,
+  )
 
   const parse = createParser()
   let batch: { parsed: NonNullable<ReturnType<LineParser>>; idx: number }[] = []
@@ -217,7 +230,25 @@ export async function indexSessionFile(
   const flush = () => {
     const end = consumed
     const fp = fingerprint(filePath, end)
+    let cwd: string | null = null
+    let branch: string | null = null
+    let minTs: number | null = null
+    let maxTs: number | null = null
+    let title: { text: string; rank: number } | null = null
+    for (const { parsed } of batch) {
+      if (!cwd && parsed.cwd) cwd = parsed.cwd
+      if (parsed.gitBranch) branch = parsed.gitBranch
+      if (parsed.tsMs != null) {
+        minTs = minTs == null ? parsed.tsMs : Math.min(minTs, parsed.tsMs)
+        maxTs = maxTs == null ? parsed.tsMs : Math.max(maxTs, parsed.tsMs)
+      }
+      // Later lines win at equal rank: a session renamed twice shows the newest name.
+      const st = parsed.sessionTitle
+      if (st && (!title || st.rank >= title.rank)) title = st
+    }
     db.transaction(() => {
+      if (batch.length) updSummary.run(cwd, branch, minTs, minTs, minTs, maxTs, maxTs, maxTs, sessionId)
+      if (title) updTitle.run(title.text, title.rank, sessionId, title.rank)
       for (const { parsed, idx } of batch) {
         const u = parsed.usage
         const info = insMsg.run(

@@ -1,5 +1,16 @@
 import type { ModelPrice } from '../shared/pricing.js'
-import { BACKUP_KEEP_CHOICES, type ExportOptions, type PromptQuery, type SearchFilters, type Settings } from '../shared/ipc.js'
+import {
+  BACKUP_KEEP_CHOICES,
+  GLOBAL_SHORTCUT_CHOICES,
+  type ExportFileFormat,
+  type ExportOptions,
+  type PromptQuery,
+  type SearchFilters,
+  type SessionExportFormat,
+  type SessionExportOptions,
+  type SessionListQuery,
+  type Settings,
+} from '../shared/ipc.js'
 
 const MAX_SEARCH_LIMIT = 200
 const MAX_EXPORT_MESSAGE_IDS = 5000
@@ -64,7 +75,59 @@ export function sanitizeSearchFilters(raw: unknown): SearchFilters {
   if (sort) out.sort = sort
   if (sinceMs != null) out.sinceMs = sinceMs
   if (untilMs != null) out.untilMs = untilMs
+  const offset = clampInt(o.offset, 0, 100_000, 0)
+  if (offset > 0) out.offset = offset
+  const planOffset = clampInt(o.planOffset, 0, 100_000, 0)
+  if (planOffset > 0) out.planOffset = planOffset
+  const text = (v: unknown, max: number) => (typeof v === 'string' && v.trim() ? v.trim().slice(0, max) : undefined)
+  const projectQuery = text(o.projectQuery, 300)
+  if (projectQuery) out.projectQuery = projectQuery
+  const branch = text(o.branch, 300)
+  if (branch) out.branch = branch
+  if (o.archived === 'archived' || o.archived === 'live') out.archived = o.archived
+  const sessionId = positiveIntOrNull(o.sessionId)
+  if (sessionId != null) out.sessionId = sessionId
+  const regex = text(o.regex, 1000)
+  if (regex) {
+    out.regex = regex
+    if (typeof o.regexFlags === 'string') out.regexFlags = o.regexFlags.replace(/[^imsu]/g, '').slice(0, 4)
+  }
   return out
+}
+
+export function sanitizeSessionListQuery(raw: unknown): SessionListQuery {
+  const o = isPlainObject(raw) ? raw : {}
+  const out: SessionListQuery = {
+    query: typeof o.query === 'string' ? o.query.slice(0, 300) : '',
+    archived: o.archived === 'archived' || o.archived === 'live' ? o.archived : 'all',
+    sort: o.sort === 'oldest' || o.sort === 'longest' ? o.sort : 'recent',
+    offset: clampInt(o.offset, 0, 1_000_000, 0),
+    limit: clampInt(o.limit, 1, 200, 50),
+  }
+  const projectId = positiveIntOrNull(o.projectId)
+  if (projectId != null) out.projectId = projectId
+  return out
+}
+
+export function sanitizeTranscriptWindow(raw: unknown): { from?: number; aroundLine?: number } {
+  const o = isPlainObject(raw) ? raw : {}
+  const out: { from?: number; aroundLine?: number } = {}
+  if (o.from != null) out.from = clampInt(o.from, 0, 10_000_000, 0)
+  if (typeof o.aroundLine === 'number' && o.aroundLine >= 0) out.aroundLine = clampInt(o.aroundLine, 0, 10_000_000, 0)
+  return out
+}
+
+export function sanitizeSessionExportFormat(raw: unknown): SessionExportFormat {
+  return raw === 'html' ? 'html' : 'md'
+}
+
+export function sanitizeSessionExportOptions(raw: unknown): SessionExportOptions {
+  const o = isPlainObject(raw) ? raw : {}
+  return { includeTools: o.includeTools === true, includeMeta: o.includeMeta === true }
+}
+
+export function sanitizeLocale(raw: unknown): 'ko' | 'en' {
+  return raw === 'en' ? 'en' : 'ko'
 }
 
 export function sanitizeExportMessageIds(raw: unknown): number[] {
@@ -134,6 +197,9 @@ export function sanitizeSettingsPatch(raw: unknown): Partial<Settings> {
   if (o.archiveMode === 'keep' || o.archiveMode === 'mirror') out.archiveMode = o.archiveMode
   if (typeof o.autoUpdate === 'boolean') out.autoUpdate = o.autoUpdate
   if ((BACKUP_KEEP_CHOICES as readonly unknown[]).includes(o.backupKeep)) out.backupKeep = o.backupKeep as number
+  if (typeof o.maskSecrets === 'boolean') out.maskSecrets = o.maskSecrets
+  if (typeof o.archiveNotify === 'boolean') out.archiveNotify = o.archiveNotify
+  if ((GLOBAL_SHORTCUT_CHOICES as readonly unknown[]).includes(o.globalShortcut)) out.globalShortcut = o.globalShortcut as string
   return out
 }
 
@@ -146,6 +212,11 @@ export function sanitizeClipboardText(raw: unknown): string {
 
 export function sanitizeExportFormat(raw: unknown): 'md' | 'csv' {
   return raw === 'csv' ? 'csv' : 'md'
+}
+
+/** Formats a saved file may have: the message exports plus a session's HTML page. */
+export function sanitizeExportFileFormat(raw: unknown): ExportFileFormat {
+  return raw === 'csv' || raw === 'html' ? raw : 'md'
 }
 
 export function sanitizeFileQuery(raw: unknown): string {

@@ -106,6 +106,23 @@ await page.getByRole('dialog').waitFor()
 await shot('transcript')
 await page.keyboard.press('Escape')
 
+await nav('Sessions')
+await page.locator('main [data-index="0"]').waitFor()
+await shot('sessions')
+
+// A session with a tool edit, tool rows shown, scrolled to the first diff.
+await page.locator('main [data-index="0"] button').first().click()
+await page.getByRole('dialog').waitFor()
+await page.getByLabel('Show tool calls and results').check()
+await page.locator('.diff').first().waitFor()
+// Scroll the transcript pane, not the dialog (scrollIntoView would move the header away).
+await page.locator('.diff').first().evaluate((el) => {
+  const body = el.closest('[data-transcript-body]')
+  body.scrollTop += el.getBoundingClientRect().top - body.getBoundingClientRect().top - body.clientHeight / 3
+})
+await shot('diff')
+await page.keyboard.press('Escape')
+
 await nav('My prompts')
 await page.getByRole('button', { name: 'Most used', exact: true }).click()
 await page.waitForTimeout(400)

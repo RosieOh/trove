@@ -40,10 +40,27 @@ export const IPC = {
   updateCheck: 'vault:updateCheck',
   updateInstall: 'vault:updateInstall',
   updateStatus: 'vault:updateStatus',
+  mcpCommand: 'vault:mcpCommand',
   onIndexUpdated: 'vault:onIndexUpdated',
   onIndexProgress: 'vault:onIndexProgress',
   onUpdateStatus: 'vault:onUpdateStatus',
+  sessionsList: 'vault:sessionsList',
+  sessionDetail: 'vault:sessionDetail',
+  transcriptPage: 'vault:transcriptPage',
+  exportSession: 'vault:exportSession',
+  handoffPrompt: 'vault:handoffPrompt',
+  onFocusSearch: 'vault:onFocusSearch',
+  onArchiveNews: 'vault:onArchiveNews',
 } as const
+
+/** How Claude Code starts Trove's local MCP server (ADR-0011). */
+export type McpCommand = {
+  command: string
+  args: string[]
+  env: Record<string, string>
+  /** Ready-to-paste `claude mcp add trove …` line. */
+  claudeAddLine: string
+}
 
 export type FileRow = {
   path: string
@@ -192,6 +209,20 @@ export type SearchFilters = {
   sinceMs?: number
   /** 이 epoch(ms) 이전 메시지만. */
   untilMs?: number
+  /** Messages already shown: the next page starts here (messages and plans page separately). */
+  offset?: number
+  planOffset?: number
+  /** `project:` operator — substring of the project's display name, case-insensitive. */
+  projectQuery?: string
+  /** `branch:` operator — substring of the git branch recorded on the line. */
+  branch?: string
+  /** `is:archived` / `is:live`. */
+  archived?: 'archived' | 'live'
+  /** Only this session (search inside one transcript). */
+  sessionId?: number
+  /** `/…/` query: a JavaScript regular expression over message bodies, instead of `query`. */
+  regex?: string
+  regexFlags?: string
 }
 
 export type RecentSessionRow = {
@@ -202,6 +233,97 @@ export type RecentSessionRow = {
   preview: string | null
   archived: boolean
 }
+
+export type SessionSort = 'recent' | 'oldest' | 'longest'
+
+export type SessionListQuery = {
+  projectId?: number
+  /** Matches title, first prompt, working directory and branch. */
+  query?: string
+  archived?: 'all' | 'archived' | 'live'
+  sort?: SessionSort
+  offset?: number
+  limit?: number
+}
+
+/** A top-level session: subagent transcripts are counted on their parent, not listed. */
+export type SessionListRow = {
+  sessionId: number
+  projectId: number
+  projectName: string
+  tool: string
+  sessionFile: string
+  title: string | null
+  /** First prompt I typed in it (or first dialog line). */
+  preview: string | null
+  cwd: string | null
+  gitBranch: string | null
+  firstTsMs: number | null
+  lastTsMs: number | null
+  mtime: number
+  messageCount: number
+  subagentCount: number
+  archived: boolean
+  archivedAt: number | null
+}
+
+export type SessionListResult = { rows: SessionListRow[]; total: number }
+
+export type SubagentRow = {
+  sessionId: number
+  sessionFile: string
+  title: string | null
+  preview: string | null
+  messageCount: number
+  firstTsMs: number | null
+  lastTsMs: number | null
+}
+
+export type SessionDetail = {
+  sessionId: number
+  projectId: number
+  projectName: string
+  tool: string
+  sessionFile: string
+  filePath: string
+  title: string | null
+  cwd: string | null
+  gitBranch: string | null
+  firstTsMs: number | null
+  lastTsMs: number | null
+  messageCount: number
+  promptCount: number
+  archivedAt: number | null
+  /** Shell line that reopens it, or null when the tool's session id is unknown. */
+  resumeCommand: string | null
+  forkCommand: string | null
+  /** Set for a subagent transcript: the session that started it. */
+  parentSessionId: number | null
+  subagents: SubagentRow[]
+  /** API responses in this session, counted once each. */
+  tokensByModel: ModelTokenRow[]
+  filesTouched: number
+}
+
+export type TranscriptPage = {
+  rows: SessionMessageRow[]
+  /** Line-ordered position of `rows[0]` among all of the session's rows. */
+  from: number
+  total: number
+}
+
+export type SessionExportFormat = 'md' | 'html'
+
+export type SessionExportOptions = {
+  includeTools?: boolean
+  includeMeta?: boolean
+}
+
+/** Text that leaves the app, and how many secrets were masked on the way. */
+export type MaskedText = { text: string; masked: number }
+
+/** Sessions Claude Code deleted since the last notice, now kept only in the vault. */
+export type ArchiveNews = { newlyArchived: number; totalArchived: number }
 
 export type PromptSort = 'recent' | 'frequent'
 
@@ -293,6 +415,52 @@ export type StatsPayload = {
   activityFromTimestamps: boolean
   /** Local days (`YYYY-MM-DD`, oldest first) the app was opened in the last ~two months. */
   appOpenDays: string[]
+  /** Prompts per local day over the 53-week grid ending this week; days with none left out. */
+  activityYear: { day: string; count: number }[]
+  /** Prompts by local weekday (0 = Sunday) and hour, all time; empty cells left out. */
+  activityByHour: { weekday: number; hour: number; count: number }[]
+  /** Usage per project (top 15 by tokens), each API response counted once. */
+  tokensByProject: ProjectUsageRow[]
+  /** Most-called tools (top 20); `errors` is a heuristic, see `ToolUsageRow`. */
+  toolUsage: ToolUsageRow[]
+  /** The last 10 five-hour usage blocks, oldest first. */
+  usageBlocks: UsageBlock[]
+}
+
+export type ProjectUsageRow = {
+  projectId: number
+  projectName: string
+  sessions: number
+  /** API responses (deduplicated); a response held by sessions of two projects counts in the first. */
+  responses: number
+  input: number
+  output: number
+  cacheRead: number
+  cacheCreation: number
+  cacheCreation1h: number
+  byModel: ModelTokenRow[]
+}
+
+export type ToolUsageRow = {
+  tool: string
+  /** Calls, counted once per transcript line. */
+  calls: number
+  /**
+   * Results that look like errors (start with `<tool_use_error>`, `Error:`, `error:` or
+   * `Exit code <n>`), matched to calls by order. An approximation: the index does not keep `is_error`.
+   */
+  errors: number
+}
+
+/** A Claude subscription window: opens at the hour of its first response, lasts five hours. */
+export type UsageBlock = {
+  startMs: number
+  endMs: number
+  responses: number
+  input: number
+  output: number
+  cacheRead: number
+  cacheCreation: number
 }
 
 export type ReindexResult = {
@@ -325,7 +493,15 @@ export type Settings = {
   autoUpdate: boolean
   /** How many DB snapshots to keep (0 turns automatic backups off). */
   backupKeep: number
+  /** Mask tokens, keys and passwords in copied and exported text. */
+  maskSecrets: boolean
+  /** Accelerator that shows Trove from anywhere ('' = off). One of `GLOBAL_SHORTCUT_CHOICES`. */
+  globalShortcut: string
+  /** System notification when Trove keeps sessions Claude Code deleted. */
+  archiveNotify: boolean
 }
+
+export const GLOBAL_SHORTCUT_CHOICES = ['', 'CommandOrControl+Shift+Space', 'Alt+Shift+Space', 'CommandOrControl+Alt+Y'] as const
 
 export type SettingsInfo = Settings & {
   dbPath: string
@@ -336,6 +512,8 @@ export type SettingsInfo = Settings & {
 }
 
 export type ExportSaveResult = { saved: boolean; path?: string; error?: string }
+
+export type ExportFileFormat = 'md' | 'csv' | 'html'
 
 /** Allowed values for `Settings.backupKeep`; 0 turns automatic backups off. */
 export const BACKUP_KEEP_CHOICES = [0, 1, 3, 7] as const

@@ -84,6 +84,20 @@ function rowFilters(filters: SearchFilters, opts: { metaOnly?: boolean } = {}): 
     parts.push(`m.ts_ms IS NOT NULL AND m.ts_ms <= ?`)
     params.push(Math.trunc(filters.untilMs))
   }
+  if (filters.projectQuery) {
+    parts.push(`p.display_name LIKE ? ESCAPE '\\'`)
+    params.push(likePattern(filters.projectQuery))
+  }
+  if (filters.branch) {
+    parts.push(`m.git_branch LIKE ? ESCAPE '\\'`)
+    params.push(likePattern(filters.branch))
+  }
+  if (filters.archived === 'archived') parts.push(`s.archived_at IS NOT NULL`)
+  else if (filters.archived === 'live') parts.push(`s.archived_at IS NULL`)
+  if (filters.sessionId != null) {
+    parts.push(`s.id = ?`)
+    params.push(filters.sessionId)
+  }
   return { sql: parts.length ? parts.map((p) => `(${p})`).join(' AND ') : '1=1', params }
 }
 
@@ -164,7 +178,7 @@ function mapRows(rows: HitRow[]): SearchHit[] {
   }))
 }
 
-function likeSearch(db: DbHandle, filters: SearchFilters, limit: number, metaOnly: boolean): SearchHit[] {
+function likeSearch(db: DbHandle, filters: SearchFilters, limit: number, metaOnly: boolean, offset = 0): SearchHit[] {
   const q = filters.query.trim()
   const where = rowFilters(filters, { metaOnly })
   const textWhere = q ? `m.body LIKE ? ESCAPE '\\'` : '1=1'
@@ -175,17 +189,79 @@ function likeSearch(db: DbHandle, filters: SearchFilters, limit: number, metaOnl
     JOIN projects p ON p.id = s.project_id
     WHERE ${textWhere} AND ${where.sql}
     ${messageOrderBy(filters.sort, 'ORDER BY (m.ts_ms IS NULL) ASC, m.ts_ms DESC, m.id DESC')}
-    LIMIT ${limit}`
+    LIMIT ${limit} OFFSET ${offset}`
   const params = q ? [likePattern(q), ...where.params] : where.params
   return mapRows(db.prepare(sql).all(...params) as HitRow[])
 }
 
+/** Handles that already have the `regexp` SQL function. */
+const withRegexp = new WeakSet<DbHandle>()
+/** One compiled pattern per query, not per row. */
+let lastRegex: { key: string; re: RegExp | null } = { key: '', re: null }
+
+function compiled(source: string, flags: string): RegExp | null {
+  const key = `${flags}/${source}`
+  if (lastRegex.key !== key) {
+    let re: RegExp | null = null
+    try {
+      re = new RegExp(source, flags.replace(/[gy]/g, ''))
+    } catch {
+      re = null
+    }
+    lastRegex = { key, re }
+  }
+  return lastRegex.re
+}
+
+/** SQLite has no REGEXP of its own; `x REGEXP y` calls `regexp(y, x)`. Flags travel as `flags/source`. */
+function ensureRegexp(db: DbHandle): void {
+  if (withRegexp.has(db)) return
+  db.function('regexp', { deterministic: true }, (pattern: unknown, value: unknown) => {
+    if (typeof pattern !== 'string' || typeof value !== 'string') return 0
+    const slash = pattern.indexOf('/')
+    const re = compiled(pattern.slice(slash + 1), pattern.slice(0, slash))
+    return re && re.test(value) ? 1 : 0
+  })
+  withRegexp.add(db)
+}
+
+/** A «marked» excerpt around the first match, like FTS `snippet()`. */
+export function regexSnippet(body: string, re: RegExp, radius = 60): string {
+  const m = re.exec(body)
+  if (!m) return body.slice(0, 120)
+  const start = Math.max(0, m.index - radius)
+  const end = Math.min(body.length, m.index + m[0].length + radius)
+  return `${start > 0 ? '…' : ''}${body.slice(start, m.index)}«${m[0]}»${body.slice(m.index + m[0].length, end)}${end < body.length ? '…' : ''}`
+}
+
+/** A scan of every body through a JS regex: slow, so only on the query worker and only on request. */
+function regexSearch(db: DbHandle, filters: SearchFilters, limit: number, offset: number): SearchHit[] {
+  const source = filters.regex ?? ''
+  const flags = (filters.regexFlags ?? '').replace(/[^imsu]/g, '')
+  const re = compiled(source, flags)
+  if (!re) return []
+  ensureRegexp(db)
+  const where = rowFilters(filters)
+  const sql = `
+    SELECT ${HIT_COLUMNS}, '' AS snippet, 0 AS rank
+    FROM messages m
+    JOIN sessions s ON s.id = m.session_id
+    JOIN projects p ON p.id = s.project_id
+    WHERE m.body REGEXP ? AND ${where.sql}
+    ${messageOrderBy(filters.sort, 'ORDER BY (m.ts_ms IS NULL) ASC, m.ts_ms DESC, m.id DESC')}
+    LIMIT ${limit} OFFSET ${offset}`
+  const hits = mapRows(db.prepare(sql).all(`${flags}/${source}`, ...where.params) as HitRow[])
+  return hits.map((h) => ({ ...h, snippet: regexSnippet(h.body, new RegExp(re.source, re.flags)) }))
+}
+
 export function searchMessages(db: DbHandle, filters: SearchFilters): SearchHit[] {
   const limit = Math.min(filters.limit ?? 80, 200)
+  const offset = Math.max(0, Math.trunc(filters.offset ?? 0))
+  if (filters.regex) return regexSearch(db, filters, limit, offset)
   const q = filters.query.trim()
   if (!q) {
-    // An empty query is only meaningful as "everything with this tag".
-    return filters.tagId != null ? likeSearch(db, filters, limit, false) : []
+    // An empty query is only meaningful as "everything with this tag" (or in one session).
+    return filters.tagId != null || filters.sessionId != null ? likeSearch(db, filters, limit, false, offset) : []
   }
   const fts = buildFtsQuery(q, filters.matchMode)
   let hits: SearchHit[] = []
@@ -202,22 +278,34 @@ export function searchMessages(db: DbHandle, filters: SearchFilters): SearchHit[
       JOIN projects p ON p.id = s.project_id
       WHERE messages_fts MATCH ? AND ${where.sql}
       ${messageOrderBy(filters.sort, 'ORDER BY rank')}
-      LIMIT ${limit}`
+      LIMIT ${limit} OFFSET ${offset}`
     try {
       hits = mapRows(db.prepare(sql).all(fts, ...where.params) as HitRow[])
       ftsOk = true
     } catch {
       /* malformed FTS query → substring fallback below */
     }
+    // A later page that comes back empty only means the token results ran out — unless
+    // there were never any, in which case the first page was the substring fallback.
+    if (ftsOk && hits.length === 0 && offset > 0) {
+      const any = db
+        .prepare(
+          `SELECT 1 FROM messages_fts JOIN messages m ON m.id = messages_fts.rowid
+           JOIN sessions s ON s.id = m.session_id JOIN projects p ON p.id = s.project_id
+           WHERE messages_fts MATCH ? AND ${where.sql} LIMIT 1`,
+        )
+        .get(fts, ...where.params)
+      if (any) return []
+    }
   }
   // Token search can't match inside a word ("색인" in "재색인"); when it finds
   // nothing, fall back to a substring scan so infix queries still work.
   // A one-character scan of every body finds nothing FTS prefixes would miss.
   if ((!ftsOk || hits.length === 0) && q.length >= 2) {
-    hits = likeSearch(db, filters, limit, false)
+    hits = likeSearch(db, filters, limit, false, offset)
   }
-  // Bookkeeping lines are not in the FTS index; include them only when asked to.
-  if (filters.excludeMeta === false && hits.length < limit) {
+  // Bookkeeping lines are not in the FTS index; include them only when asked to (first page).
+  if (filters.excludeMeta === false && hits.length < limit && offset === 0) {
     const seen = new Set(hits.map((h) => h.messageId))
     for (const h of likeSearch(db, filters, limit - hits.length, true)) {
       if (!seen.has(h.messageId)) hits.push(h)
@@ -254,6 +342,7 @@ export function searchPlans(db: DbHandle, filters: SearchFilters): PlanHit[] {
     return []
   }
   const limit = Math.min(filters.limit ?? 80, 200)
+  const offset = Math.max(0, Math.trunc(filters.planOffset ?? 0))
   const fts = buildFtsQuery(filters.query, filters.matchMode)
   const planDate: string[] = []
   const planDateParams: number[] = []
@@ -285,11 +374,11 @@ export function searchPlans(db: DbHandle, filters: SearchFilters): PlanHit[] {
       JOIN plan_files pf ON pf.id = plan_files_fts.rowid
       WHERE plan_files_fts MATCH ?${planDateSql}
       ${planOrder}
-      LIMIT ${limit}
+      LIMIT ${limit} OFFSET ${offset}
     `
     try {
       const rows = db.prepare(ftsSql).all(fts, ...planDateParams) as Parameters<typeof mapPlanRows>[0]
-      if (rows.length) return mapPlanRows(rows)
+      if (rows.length || offset > 0) return mapPlanRows(rows)
     } catch {
       /* LIKE fallback */
     }
@@ -307,7 +396,7 @@ export function searchPlans(db: DbHandle, filters: SearchFilters): PlanHit[] {
     FROM plan_files pf
     WHERE (pf.title LIKE ? ESCAPE '\\' OR pf.body LIKE ? ESCAPE '\\')${planDateSql}
     ORDER BY pf.file_mtime_ms DESC
-    LIMIT ${limit}
+    LIMIT ${limit} OFFSET ${offset}
   `
   const pat = likePattern(filters.query.trim())
   const rows = db.prepare(likeSql).all(pat, pat, ...planDateParams) as Parameters<typeof mapPlanRows>[0]
@@ -348,7 +437,13 @@ export function orderedAllScopeHits(
 export function unifiedSearch(db: DbHandle, filters: SearchFilters): UnifiedSearchHit[] {
   const scope = filters.scope ?? 'messages'
   /** `plan_files`에 project_id·태그 없음 — 프로젝트나 태그로 좁히면 대화만 검색 */
-  const narrowed = filters.projectId != null || filters.tagId != null
+  const narrowed =
+    filters.projectId != null ||
+    filters.tagId != null ||
+    filters.projectQuery != null ||
+    filters.branch != null ||
+    filters.sessionId != null ||
+    filters.regex != null
   const messages =
     scope === 'messages' || scope === 'all'
       ? searchMessages(db, filters).map((h): UnifiedSearchHit => ({ ...h, hitType: 'message' }))

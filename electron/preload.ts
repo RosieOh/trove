@@ -10,6 +10,7 @@ import type {
   FileRow,
   FileTouchRow,
   IndexProgress,
+  McpCommand,
   PlanListRow,
   ProjectRow,
   PromptQuery,
@@ -27,6 +28,15 @@ import type {
   TemplateRow,
   UpdateStatus,
   UnifiedSearchHit,
+  ArchiveNews,
+  ExportFileFormat,
+  MaskedText,
+  SessionDetail,
+  SessionExportFormat,
+  SessionExportOptions,
+  SessionListQuery,
+  SessionListResult,
+  TranscriptPage,
 } from '../shared/ipc.js'
 
 contextBridge.exposeInMainWorld('vault', {
@@ -35,7 +45,7 @@ contextBridge.exposeInMainWorld('vault', {
   plansList: (): Promise<PlanListRow[]> => ipcRenderer.invoke(IPC.plansList),
   planBody: (planId: number): Promise<string> => ipcRenderer.invoke(IPC.planBody, planId),
   reindex: (reparse?: boolean): Promise<ReindexResult> => ipcRenderer.invoke(IPC.reindex, reparse === true),
-  copyText: (text: string): Promise<void> => ipcRenderer.invoke(IPC.copyText, text),
+  copyText: (text: string): Promise<number> => ipcRenderer.invoke(IPC.copyText, text),
   messageBody: (messageId: number): Promise<string> => ipcRenderer.invoke(IPC.messageBody, messageId),
   favoritesList: (): Promise<FavoriteRow[]> => ipcRenderer.invoke(IPC.favoritesList),
   favoriteAdd: (messageId: number): Promise<void> => ipcRenderer.invoke(IPC.favoriteAdd, messageId),
@@ -50,7 +60,7 @@ contextBridge.exposeInMainWorld('vault', {
   stats: (): Promise<StatsPayload> => ipcRenderer.invoke(IPC.stats),
   exportMessages: (messageIds: number[], format: 'md' | 'csv', opts?: ExportOptions): Promise<string> =>
     ipcRenderer.invoke(IPC.exportMessages, messageIds, format, opts ?? {}),
-  exportSave: (text: string, format: 'md' | 'csv'): Promise<ExportSaveResult> =>
+  exportSave: (text: string, format: ExportFileFormat): Promise<ExportSaveResult> =>
     ipcRenderer.invoke(IPC.exportSave, text, format),
   sessionTranscript: (sessionId: number): Promise<SessionMessageRow[]> =>
     ipcRenderer.invoke(IPC.sessionTranscript, sessionId),
@@ -80,6 +90,7 @@ contextBridge.exposeInMainWorld('vault', {
   updateStatus: (): Promise<UpdateStatus> => ipcRenderer.invoke(IPC.updateStatus),
   updateCheck: (): Promise<UpdateStatus> => ipcRenderer.invoke(IPC.updateCheck),
   updateInstall: (): Promise<void> => ipcRenderer.invoke(IPC.updateInstall),
+  mcpCommand: (): Promise<McpCommand> => ipcRenderer.invoke(IPC.mcpCommand),
   onUpdateStatus: (cb: (s: UpdateStatus) => void): (() => void) => {
     const listener = (_e: unknown, s: UpdateStatus): void => cb(s)
     ipcRenderer.on(IPC.onUpdateStatus, listener)
@@ -94,5 +105,27 @@ contextBridge.exposeInMainWorld('vault', {
     const listener = (_e: unknown, p: IndexProgress): void => cb(p)
     ipcRenderer.on(IPC.onIndexProgress, listener)
     return () => ipcRenderer.removeListener(IPC.onIndexProgress, listener)
+  },
+  sessionsList: (q: SessionListQuery): Promise<SessionListResult> => ipcRenderer.invoke(IPC.sessionsList, q),
+  sessionDetail: (sessionId: number): Promise<SessionDetail | null> => ipcRenderer.invoke(IPC.sessionDetail, sessionId),
+  transcriptPage: (sessionId: number, window: { from?: number; aroundLine?: number }): Promise<TranscriptPage> =>
+    ipcRenderer.invoke(IPC.transcriptPage, sessionId, window),
+  exportSession: (
+    sessionId: number,
+    format: SessionExportFormat,
+    opts: SessionExportOptions,
+    locale: 'ko' | 'en',
+  ): Promise<MaskedText> => ipcRenderer.invoke(IPC.exportSession, sessionId, format, opts, locale),
+  handoffPrompt: (sessionId: number, locale: 'ko' | 'en'): Promise<MaskedText> =>
+    ipcRenderer.invoke(IPC.handoffPrompt, sessionId, locale),
+  onFocusSearch: (cb: () => void): (() => void) => {
+    const listener = (): void => cb()
+    ipcRenderer.on(IPC.onFocusSearch, listener)
+    return () => ipcRenderer.removeListener(IPC.onFocusSearch, listener)
+  },
+  onArchiveNews: (cb: (n: ArchiveNews) => void): (() => void) => {
+    const listener = (_e: unknown, n: ArchiveNews): void => cb(n)
+    ipcRenderer.on(IPC.onArchiveNews, listener)
+    return () => ipcRenderer.removeListener(IPC.onArchiveNews, listener)
   },
 })

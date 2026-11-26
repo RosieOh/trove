@@ -5,7 +5,7 @@ import { readLines } from './lineReader.js'
 
 export type DbHandle = Database.Database
 
-export const SCHEMA_VERSION = 10
+export const SCHEMA_VERSION = 11
 
 /** The file was written by a newer build. This build cannot know what a write would break. */
 export class NewerSchemaError extends Error {
@@ -94,6 +94,14 @@ const SCHEMA_SQL = `
     -- Set when the source file disappeared (e.g. Claude Code's transcript cleanup)
     -- and the archive setting kept the rows.
     archived_at INTEGER,
+    -- Summary kept up to date by the indexer so the session list never aggregates
+    -- messages (v11). Title rank: 3 custom-title, 2 ai-title, 1 summary.
+    title TEXT,
+    title_rank INTEGER,
+    cwd TEXT,
+    git_branch TEXT,
+    first_ts_ms INTEGER,
+    last_ts_ms INTEGER,
     UNIQUE(project_id, rel_path)
   );
 
@@ -259,6 +267,15 @@ const SCHEMA_SQL = `
     api_msg_id, request_id, model, input_tokens, output_tokens,
     cache_read_tokens, cache_creation_tokens, cache_creation_1h_tokens
   ) WHERE input_tokens IS NOT NULL;
+  -- The same per-response read with each response's session and time, for usage by project
+  -- and the 5-hour usage blocks.
+  CREATE INDEX IF NOT EXISTS idx_messages_usage_where ON messages(
+    api_msg_id, request_id, session_id, ts_ms, model, input_tokens, output_tokens,
+    cache_read_tokens, cache_creation_tokens, cache_creation_1h_tokens
+  ) WHERE input_tokens IS NOT NULL;
+  -- Tool calls and tool results, in transcript order, for tool usage stats.
+  CREATE INDEX IF NOT EXISTS idx_messages_tool ON messages(session_id, line_index)
+    WHERE role = 'tool' OR content_kinds LIKE '%"tool_use"%';
   CREATE INDEX IF NOT EXISTS idx_messages_class_role ON messages(message_class, role);
   CREATE INDEX IF NOT EXISTS idx_messages_prompt ON messages(ts_ms) WHERE is_prompt = 1;
   CREATE INDEX IF NOT EXISTS idx_sessions_project ON sessions(project_id);
@@ -288,7 +305,10 @@ function migrate(db: DbHandle) {
   else if (v === 0 && tableExists(db, 'messages')) migrateLegacyToV9(db)
   // Superseded by the covering idx_messages_usage_cover (early v9 builds created it).
   db.exec(`DROP INDEX IF EXISTS idx_messages_usage`)
+  // v10 → v11: session summary columns. They must exist before SCHEMA_SQL creates indexes on them.
+  if (tableExists(db, 'sessions')) addSessionSummaryColumns(db)
   db.exec(SCHEMA_SQL)
+  if (v > 0 && v < 11) backfillSessionSummaries(db)
   // v9 → v10: plans follow archive mode. Adding a nullable column needs no re-parse.
   if (!columns(db, 'plan_files').has('archived_at')) db.exec(`ALTER TABLE plan_files ADD COLUMN archived_at INTEGER`)
   // From v9 on, a migration must never drop sessions/messages wholesale: archived
@@ -299,6 +319,45 @@ function migrate(db: DbHandle) {
       `INSERT INTO meta(key, value) VALUES('schema_version', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
     ).run(String(SCHEMA_VERSION))
   }
+}
+
+const SESSION_SUMMARY_COLUMNS: [string, string][] = [
+  ['title', 'TEXT'],
+  ['title_rank', 'INTEGER'],
+  ['cwd', 'TEXT'],
+  ['git_branch', 'TEXT'],
+  ['first_ts_ms', 'INTEGER'],
+  ['last_ts_ms', 'INTEGER'],
+]
+
+function addSessionSummaryColumns(db: DbHandle): void {
+  const have = columns(db, 'sessions')
+  for (const [name, type] of SESSION_SUMMARY_COLUMNS) {
+    if (!have.has(name)) db.exec(`ALTER TABLE sessions ADD COLUMN ${name} ${type}`)
+  }
+}
+
+/** Title prefix the parser gives `ai-title` / `custom-title` lines (see `operationalLabel`). */
+const TITLE_PREFIX = '[제목] '
+
+/**
+ * Fills the v11 summary columns from rows already indexed, archived sessions included —
+ * their files are gone, so a re-parse could never fill them. Additive: nothing is dropped.
+ */
+export function backfillSessionSummaries(db: DbHandle): void {
+  db.prepare(
+    `UPDATE sessions SET
+       cwd = (SELECT m.cwd FROM messages m WHERE m.session_id = sessions.id AND m.cwd IS NOT NULL AND m.cwd != ''
+              ORDER BY m.line_index LIMIT 1),
+       git_branch = (SELECT m.git_branch FROM messages m WHERE m.session_id = sessions.id
+                     AND m.git_branch IS NOT NULL AND m.git_branch != '' ORDER BY m.line_index DESC LIMIT 1),
+       first_ts_ms = (SELECT MIN(m.ts_ms) FROM messages m WHERE m.session_id = sessions.id),
+       last_ts_ms = (SELECT MAX(m.ts_ms) FROM messages m WHERE m.session_id = sessions.id),
+       title = (SELECT substr(m.body, ${TITLE_PREFIX.length + 1}, 300) FROM messages m
+                WHERE m.session_id = sessions.id AND m.message_class = 'meta' AND m.body LIKE '${TITLE_PREFIX}%'
+                ORDER BY m.line_index DESC LIMIT 1)`,
+  ).run()
+  db.prepare(`UPDATE sessions SET title_rank = 2 WHERE title IS NOT NULL AND title_rank IS NULL`).run()
 }
 
 /** Forces every live (non-archived) session to be parsed from byte 0 on the next scan. */
