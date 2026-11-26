@@ -62,6 +62,8 @@
 | ![我的提示词](docs/images/prompts.png) | ![统计](docs/images/stats.png) |
 | **完整会话**：整段对话，工具输出折叠显示 | **深色主题** |
 | ![会话记录](docs/images/transcript.png) | ![深色主题下的统计](docs/images/stats-dark.png) |
+| **会话**：全部会话按最新排序，一键继续 | 工具修改的 **差异视图** |
+| ![会话](docs/images/sessions.png) | ![以差异显示的工具修改](docs/images/diff.png) |
 
 截图使用的是虚构的演示记录（`scripts/demo-corpus.mjs`），可以用 `npx vite build && node scripts/screenshots.mjs` 重新生成。
 
@@ -84,6 +86,15 @@
 | 导出 Markdown / CSV — 复制或保存为文件 | 支持 |
 | **备份**：每天一份数据库快照，并在升级、清除归档和恢复之前各做一份；可在设置中恢复；无法打开的数据库会自动从最新备份恢复 | 支持（保留 3 份） |
 | 设置：归档方式、备份、更新检查、数据位置、全部重新读取 | 支持 |
+| **Claude Code 连接（MCP）**：只读的本地服务器，让 Claude Code 直接搜索你的历史，包括它已删除的会话（设置中提供 `claude mcp add` 命令） | 支持 |
+| **会话**：按项目列出全部会话，最新 / 最早 / 最长排序，仅看归档，显示 `/rename` 或 Claude Code 生成的标题，按日期分组，支持键盘操作 | 支持 |
+| **继续会话**：复制 `claude --resume`（或 `--fork-session`）命令；无法继续的会话可复制上下文给新会话 | 支持 |
+| 会话视图：分段加载不限行数、会话内查找（⌘F）、令牌与费用、子代理链接、保存为 Markdown / HTML | 支持 |
+| 工具修改文件的 **差异视图**（会话视图和文件页） | 支持 |
+| 搜索运算符：`project:` `branch:` `role:` `tag:` `after:` `before:` `is:archived` `/正则/`；按会话分组；加载更多 | 支持 |
+| 复制、导出（及 MCP 结果）中的 **密钥遮盖**，默认开启 | 支持 |
+| 全局快捷键、归档通知 | 支持（快捷键默认关闭） |
+| 统计：一年活动热力图、星期×小时、按项目费用、工具使用与错误率、5 小时区块 | 支持 |
 | Codex CLI 会话（`~/.codex/sessions`，按工作目录分组） | 尽力支持 |
 | 韩语 / 英语界面，浅色 / 深色主题 | 支持 |
 

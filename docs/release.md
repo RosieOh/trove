@@ -116,13 +116,24 @@ Downloads happen in the background but **installing is always the user's choice*
 mid-search would lose the user's place. In dev or unsigned builds the updater is
 skipped entirely.
 
-## Homebrew Cask (outline)
+## Homebrew Cask
 
-1. Publish a signed DMG on **GitHub Releases** with a stable tag (`v0.1.0`).
-2. Fork [Homebrew/homebrew-cask](https://github.com/Homebrew/homebrew-cask) and add
-   `Casks/claude-vault.rb` with `version`, `sha256`, and `url` pointing to the asset.
-3. Follow the [Homebrew Cask contribution guide](https://docs.brew.sh/Adding-Software-to-Homebrew#casks).
-4. Until the cask is merged, users install via the DMG download from Releases.
+The cask lives in [`packaging/homebrew/trove.rb`](../packaging/homebrew/trove.rb), meant for a
+personal tap (`RosieOh/homebrew-tap`) until a notarized build can go to
+Homebrew/homebrew-cask.
+
+1. After the release workflow publishes the DMGs, download both into `release/`.
+2. `node scripts/update-cask.mjs <version>` writes the version and both `sha256` values.
+3. Copy the file to the tap repository as `Casks/trove.rb` and push it.
+4. Users install with:
+
+   ```bash
+   brew install --cask --no-quarantine rosieoh/tap/trove
+   ```
+
+   `--no-quarantine` is needed only while builds are unsigned. Once a Developer ID build
+   is notarized, drop it from the instructions and consider submitting to
+   [Homebrew/homebrew-cask](https://docs.brew.sh/Adding-Software-to-Homebrew#casks).
 
 ## Versioning
 

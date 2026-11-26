@@ -61,6 +61,8 @@
 | ![내 프롬프트](docs/images/prompts.png) | ![통계](docs/images/stats.png) |
 | **전체 세션**: 대화 전체, 도구 출력은 접힘 | **다크 테마** |
 | ![세션 대화록](docs/images/transcript.png) | ![다크 테마의 통계](docs/images/stats-dark.png) |
+| **세션**: 모든 세션을 최신순으로, 한 번에 이어가기 | 도구가 고친 내용의 **변경 비교** |
+| ![세션](docs/images/sessions.png) | ![변경 비교로 본 도구 수정](docs/images/diff.png) |
 
 스크린샷은 가상의 데모 기록(`scripts/demo-corpus.mjs`)으로 찍었어요. `npx vite build && node scripts/screenshots.mjs`로 다시 만들 수 있어요.
 
@@ -83,6 +85,15 @@
 | Markdown / CSV 내보내기 — 복사 또는 파일로 저장 | 지원 |
 | **백업**: 매일 DB 스냅숏, 업그레이드·보관본 삭제·복원 직전에도 하나씩. 설정에서 복원. 열리지 않는 DB는 최신 백업으로 자동 복구 | 지원(3개 보관) |
 | 설정: 보관 방식, 백업, 업데이트 확인, 데이터 위치, 전체 다시 읽기 | 지원 |
+| **Claude Code 연결(MCP)**: Claude Code가 지운 세션까지 Claude Code에서 직접 찾아볼 수 있는 읽기 전용 로컬 서버(설정에 `claude mcp add` 명령) | 지원 |
+| **세션**: 프로젝트별 전체 세션, 최근·오래된·긴 순, 보관본만 보기, `/rename`이나 Claude Code가 붙인 제목, 날짜 묶음과 키보드 이동 | 지원 |
+| **이어가기**: `claude --resume`(또는 `--fork-session`) 명령 복사, 이어갈 수 없는 세션은 새 세션용 맥락 복사 | 지원 |
+| 세션 화면: 줄 수 제한 없이 나눠 불러오기, 세션 안에서 찾기(⌘F), 토큰과 비용, 서브에이전트 연결, Markdown·HTML 저장 | 지원 |
+| 도구가 고친 파일의 **변경 비교(diff)**: 세션 화면과 파일 탭 | 지원 |
+| 검색창 필터: `project:` `branch:` `role:` `tag:` `after:` `before:` `is:archived` `/정규식/`, 세션별 묶기, 결과 더 보기 | 지원 |
+| 복사·내보내기(그리고 MCP 결과)에서 **비밀값 가리기**, 기본으로 켜짐 | 지원 |
+| 전역 단축키, 보관 알림 | 지원(단축키는 기본으로 꺼짐) |
+| 통계: 1년 활동, 요일×시간대, 프로젝트별 비용, 도구 사용과 실패 비율, 5시간 블록 | 지원 |
 | Codex CLI 세션(`~/.codex/sessions`, 작업 폴더별로 묶음) | 최선 노력 |
 | 한국어 / 영어 UI, 라이트 / 다크 테마 | 지원 |
 

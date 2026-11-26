@@ -44,6 +44,12 @@ flowchart LR
 - **Query worker** (`electron/queryWorker.ts`): a `query_only` connection serving search,
   stats, transcripts, prompts and the files view — every query that can take hundreds of
   milliseconds on a large corpus.
+- **MCP server** (`electron/mcpServer.ts`, a separate process): started by Claude Code over
+  stdio, not by the app. Opens the vault with `migrate: false` + `query_only`, refuses to run
+  when the DB is missing, and serves `search_history`, `find_sessions`, `session_context`,
+  `get_session`, `list_recent_sessions`, `list_prompts` and `file_history`, secrets masked. Packaged: the app binary with `ELECTRON_RUN_AS_NODE=1`
+  runs `app.asar/dist-electron/mcpServer.cjs`; `Trove --mcp` works too. See
+  [ADR-0011](decisions/0011-local-mcp-server.md).
 - **Preload**: exposes a narrow `window.vault` API via `contextBridge`.
 - **Renderer**: React + Tailwind; Fuse.js may reorder the current hit list in *relevance*
   sort only, and never drops a hit.
@@ -139,14 +145,17 @@ Run `npm run poc` to see how your own corpus classifies.
 | `string` | Top-level string content |
 | `invalid_json` | Raw preview only |
 
-## SQLite schema (v10, summary)
+## SQLite schema (v11, summary)
 
 Index tables (derived, rebuildable except archived sessions):
 
 - `projects` — one row per source project; `tool`, `archived_at`.
 - `sessions` — one row per transcript file, plus one per archived generation of a file that
   came back different (`file_path` ends in `#archived-<ms>`); `indexed_bytes`, `size_bytes`,
-  `head_hash`, `tail_hash`, `file_mtime_ms`, `message_count`, `archived_at`.
+  `head_hash`, `tail_hash`, `file_mtime_ms`, `message_count`, `archived_at`; and a summary
+  the indexer keeps current so the Sessions tab never aggregates messages (v11): `title` +
+  `title_rank` (3 `custom-title`, 2 `ai-title`, 1 legacy `summary`; a higher or equal rank
+  replaces the title), first `cwd`, latest `git_branch`, `first_ts_ms`, `last_ts_ms`.
 - `messages` — one row per non-blank line: body, kinds, class, timestamp, model, token
   columns (`input_tokens`, `output_tokens`, `cache_read_tokens`, `cache_creation_tokens`,
   `cache_creation_1h_tokens`), `msg_key`, `api_msg_id`, `request_id`, `is_prompt`,
@@ -170,12 +179,15 @@ User data (never derivable — never dropped by a migration):
   roadmap's three-days-a-week bar (`shared/appOpens.ts`). Dates only; not telemetry —
   nothing is sent.
 - `meta` — `schema_version`, `prices_seed_version`, settings as `setting.*`
-  (`archiveMode`, `autoUpdate`, `backupKeep`).
+  (`archiveMode`, `autoUpdate`, `backupKeep`, `maskSecrets`, `globalShortcut`,
+  `archiveNotify`, and `archiveNotifiedCount`, the archived-session count already announced).
 
 **Migrations.** From v9 on, a migration must never drop `sessions`/`messages`; to force a
 re-parse, call `requestFullReparse` (resets `indexed_bytes`). The v≤8 → v9 migration moved
 favorites/tags to stable keys by re-reading the referenced lines, then rebuilt the index
-tables. v9 → v10 adds `plan_files.archived_at` in place (no re-parse). Before any migration
+tables. v9 → v10 adds `plan_files.archived_at` in place (no re-parse). v10 → v11 adds the
+session summary columns and backfills them from rows already indexed (archived sessions
+included: their files are gone, so a re-parse could never fill them); no re-parse. Before any migration
 the old file is copied to the backup folder, and if that copy fails the migration does not
 run (unless backups are off). A DB with a version above `SCHEMA_VERSION` is never written.
 Document every bump here.
@@ -254,6 +266,38 @@ the app and its workers outlive a closed window, and a later one can take its pl
 - Plans: separate FTS; `scope: 'all'` returns message hits then plan hits for relevance
   sort (BM25 scales differ) and interleaves by time for time sorts. Project or tag filters
   exclude plans.
+- **Inline operators** (`shared/searchSyntax.ts`): `project:` (display-name substring),
+  `branch:` (line's git branch), `role:`, `tag:` (by name), `after:` / `before:` (local day,
+  month or year), `is:archived` / `is:live`. Unknown `word:value` tokens stay in the text.
+  A query written `/…/flags` is a JavaScript regex: the query worker registers a `regexp`
+  SQL function and scans bodies (slow, on request only); the snippet is built in JS.
+- **Paging**: `offset` (messages) and `planOffset` (plans). A later FTS page that comes back
+  empty ends the results; it only falls back to the substring scan when the token query
+  never matched at all, so pages never mix the two result sets.
+
+## Sessions view
+
+`electron/sessions.ts`, on the query worker. `listSessions` reads the v11 summary columns
+(never aggregates messages) and lists top-level sessions only; a subagent transcript
+(`{uuid}/subagents/…`) is counted on its parent. `sessionDetail` adds per-session tokens
+(each API response once, subagents included), prompt and file counts, and the resume
+command (`shared/resume.ts`: `cd <cwd> && claude --resume <uuid>`, or `codex resume <id>`).
+Trove never runs it; it is copied. An archived session cannot be resumed, so it offers a
+**handoff prompt** instead: title, folder, branch, files touched, my prompts in order and
+the last reply, to paste into a new session.
+
+`transcriptPage` serves a transcript in windows of 2,000 rows (`aroundLine` starts just
+before a search hit), so a 50k-line session never loads whole and nothing is cut off.
+`exportSession` writes a session as Markdown or a self-contained HTML page (all text
+escaped, no scripts).
+
+## Text leaving the app
+
+Clipboard writes and exports go through `shared/redact.ts` while **Settings → Mask secrets**
+is on (the default): PEM private keys, provider tokens (Anthropic, OpenAI, GitHub, GitLab,
+Slack, AWS, Google, Stripe, npm), JWTs, URL credentials, `Authorization` headers and
+`KEY=value` / `"key": "value"` pairs whose key names a secret become `••••`. Pattern-based:
+a safety net, not a guarantee. The index itself is never altered.
 
 ## Prompts view
 
@@ -273,6 +317,19 @@ archived generation hold the same line more than once. Totals read `idx_messages
 prompts their partial index, and role counts take the repeated rows back off the covering
 `idx_messages_class_role`. On a synthetic 750k rows (617 MB), warm: 63 ms when counting rows,
 155 ms now with no line repeated, 270 ms with 5% more rows repeating lines, 610 ms with 25%.
+
+The usage-by-project table and the 5-hour blocks reuse the per-response grouping through the
+covering `idx_messages_usage_where` (which adds `session_id` and `ts_ms`); a response held by
+sessions of two projects counts in the one with the lower session id. A block opens at the
+first response after the previous block closed, floored to the hour, and lasts five hours.
+The year and weekday × hour heatmaps bucket distinct prompt lines in JS, in local time. Tool
+usage walks the partial `idx_messages_tool` (tool results and `tool_use` lines, in session
+order) and reads only each body's head: the `[도구] <Name>` headers of a call, and the first
+60 characters of a result. Results carry no tool name, so each is matched to the oldest
+unanswered call in its session, and the stored body has no `is_error` flag, so a result counts
+as an error when it starts with `<tool_use_error>`, `Error:`, `error:` or `Exit code <n>` —
+an approximation, said so in the UI. On a synthetic 400k rows these four add ~250 ms, most of
+it the tool walk.
 
 `shared/pricing.ts` prices the result:
 
@@ -301,7 +358,7 @@ worker messages are typed in `electron/workerProtocol.ts`.
 ## Renderer layout
 
 `src/App.tsx` is the shell (rail, page header, search screen and its filter panel).
-Screens live in `src/tabs/` (Prompts, Files, Favorites, Templates, Stats, Export,
+Screens live in `src/tabs/` (Sessions, Prompts, Files, Favorites, Templates, Stats, Export,
 Settings), modals and the tag editor in `src/components/`, shell primitives (rail,
 header, project picker, toast, segmented control, icons) in `src/ui.tsx`, formatting
 helpers in `src/format.ts`. The visual system — tokens and glass component classes — is
@@ -329,5 +386,5 @@ helpers in `src/format.ts`. The visual system — tokens and glass component cla
 
 ## Packaging
 
-`electron-builder`; `better-sqlite3` is unpacked from asar (`**/*.node`). The two workers
-and shared chunks are emitted as `dist-electron/*.cjs`.
+`electron-builder`; `better-sqlite3` is unpacked from asar (`**/*.node`). The two workers,
+the MCP server entry (`mcpServer.cjs`) and shared chunks are emitted as `dist-electron/*.cjs`.

@@ -53,6 +53,8 @@ Unsigned macOS builds cannot update themselves; new versions appear on the Relea
 | ![My prompts](docs/images/prompts.png) | ![Stats](docs/images/stats.png) |
 | **Full session**: the whole conversation, tool output folded | **Dark theme** |
 | ![Session transcript](docs/images/transcript.png) | ![Stats in the dark theme](docs/images/stats-dark.png) |
+| **Sessions**: every session, newest first; resume in one click | **Diffs** of the edits tools made |
+| ![Sessions](docs/images/sessions.png) | ![A tool edit shown as a diff](docs/images/diff.png) |
 
 The screenshots use a synthetic demo history (`scripts/demo-corpus.mjs`); regenerate them with `npx vite build && node scripts/screenshots.mjs`.
 
@@ -75,6 +77,15 @@ The screenshots use a synthetic demo history (`scripts/demo-corpus.mjs`); regene
 | Export Markdown / CSV — copy or save to a file | Yes |
 | **Backups**: daily DB snapshots plus one before upgrades, purges and restores; restore in Settings; a DB that won't open is recovered from the newest backup | Yes (keeps 3) |
 | Settings: archive mode, backups, update checks, data location, full re-read | Yes |
+| **Claude Code connection (MCP)**: a local, read-only stdio server so Claude Code can search your history, archived sessions included (`claude mcp add` line in Settings) | Yes |
+| **Sessions**: every session by project, newest / oldest / longest, archived only; titles from `/rename` or Claude Code; date groups and keyboard navigation | Yes |
+| **Resume**: copy `claude --resume` (or `--fork-session`); for a session that can no longer be resumed, copy a context brief for a new one | Yes |
+| Session view: windowed loading (no line limit), find in session (⌘F), tokens and cost, subagent links, save as Markdown / HTML | Yes |
+| **Diffs** of tool edits in the session view and the Files tab | Yes |
+| Search operators: `project:` `branch:` `role:` `tag:` `after:` `before:` `is:archived` `/regex/`; group by session; load more | Yes |
+| **Secret masking** in copied and exported text (and MCP results), on by default | Yes |
+| Global shortcut, archive notifications | Yes (shortcut off by default) |
+| Stats: year heatmap, weekday × hour, cost by project, tool usage and error rate, 5-hour blocks | Yes |
 | Codex CLI sessions (`~/.codex/sessions`, grouped by working directory) | Best effort |
 | Korean / English UI, light / dark theme | Yes |
 
